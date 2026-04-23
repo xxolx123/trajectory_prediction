@@ -1,0 +1,39 @@
+# =============================================================================
+# lstm2 配置（骨架；model 段已基本可用，data 段待 generate_trajs 后补齐）
+# =============================================================================
+
+data:
+  raw_dir: "data/raw"
+  output_csv: "synthetic_trajectories.csv"
+  processed_dir: "data/processed"
+  scaler_filename: "scaler_intent_posvel.npz"
+
+  # 窗口长度：和历史/未来长度对齐 lstm1
+  hist_len: 20
+  fut_len: 10
+
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+model:
+  input_size: 6
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.0
+  num_intent_classes: 4
+
+loss:
+  lambda_cls: 1.0
+  lambda_reg: 1.0
+  ignore_label: -1
+
+train:
+  device: "auto"
+  seed: 42
+  batch_size: 256
+  num_epochs: 10
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  ckpt_dir: "checkpoints"
+  log_interval: 100

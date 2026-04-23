@@ -1,0 +1,8 @@
+20251204 
+
+- 网络融合
+	- 轨迹 203_prediction_multi_pytorch_without_map_v0.2
+	- 意图 203_prediction_intention_pytorch_v0
+
+- 将网络输出拼接为 3 * 68, 与之前的部署端对接
+- 归一化在内部实现

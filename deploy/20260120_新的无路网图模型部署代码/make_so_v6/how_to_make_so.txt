@@ -1,0 +1,48 @@
+# 0) 目录准备
+# 确保项目根目录包含这四个源码文件 + 模型与资源：
+#   deploy_3trajs.h
+#   deploy_3trajs.cpp     # 内部唯一包含 stb_image.h 的实现
+#   lstm_predict_v1.h
+#   lstm_predict_v1.cpp
+# 以及：
+#   stb_image.h           # 与源码放同一目录
+#   model_lite_nchw.ms    # MindSpore Lite 模型）（编译so时其实不用这个）
+#   map.png               # 路网图（若调用时不传 routes，会用它）（编译so时其实不用这个）
+
+
+# 1) 清理并配置构建（仅需传入 MSLITE_ROOT）
+rm -rf build
+mkdir -p build && cd build
+
+cmake .. -DCMAKE_BUILD_TYPE=Release -DMSLITE_ROOT=/root/mindspore-lite-2.7.0-linux-aarch64/runtime
+
+# 2) 编译
+cmake --build . -j
+
+# 4) 回退，如果需要重新编译
+
+# 3) 产物
+# 成功后会生成：
+#   build/lib_lstm_prediction.so
+# CMake 也会按 VERSION/SOVERSION 生成兼容名：
+#   lib_lstm_prediction.so.1.0.0
+#   lib_lstm_prediction.so.1
+# 它们是同一个库不同的 SONAME/软链接，正常现象。
+
+# 4) 运行前检查依赖
+ldd lib_lstm_prediction.so
+# 关键依赖应能找到（路径可能不同）：
+#   libmindspore-lite.so => /opt/mindspore-lite-2.7.0-linux-aarch64/runtime/lib/libmindspore-lite.so  (0x...)
+#   libstdc++.so.6 => ...
+#   libm.so.6 => ...
+#   libgcc_s.so.1 => ...
+#   libc.so.6 => ...
+# 若 libmindspore-lite.so 未解析到，请设置运行时库路径：
+
+export LD_LIBRARY_PATH=/opt/mindspore-lite-2.7.0-linux-aarch64/runtime/lib:$LD_LIBRARY_PATH
+
+# 5) （可选）安装到指定前缀
+# cmake --install . --prefix /你的安装前缀
+# 会把：
+#   include/ 下安装 deploy_3trajs.h, lstm_predict_v1.h
+#   lib/ 下安装 lib_lstm_prediction.so 等

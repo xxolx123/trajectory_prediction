@@ -1,0 +1,33 @@
+# =============================================================================
+# fusion 配置：指向各子网络的 config / ckpt / scaler
+# 路径可以是相对本 yaml 的相对路径，也可以是绝对路径
+# =============================================================================
+
+lstm1:
+  config: "../lstm1/config.yaml"
+  ckpt:   ""                                          # 可空（用随机权重）
+  scaler: "../lstm1/data/processed/scaler_posvel.npz" # 可空（fusion 自动用 mean=0/std=1）
+
+gnn1:
+  config: "../gnn1/config.yaml"
+  ckpt:   ""
+
+constraint_optimizer:
+  config: "../constraint_optimizer/config.yaml"
+  ckpt:   ""
+
+lstm2:
+  config: "../lstm2/config.yaml"
+  ckpt:   ""
+
+gnn2:
+  config: "../gnn2/config.yaml"
+  ckpt:   ""
+
+# FullNetV2 自己需要的参数（必须与各子网络对齐）
+full_net:
+  hist_len: 20
+  fut_len: 10
+  feature_dim: 6
+  n_modes: 3
+  use_delta_A: true

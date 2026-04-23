@@ -1,0 +1,93 @@
+data:
+  raw_dir: "data/raw"
+  output_csv: "synthetic_trajectories.csv"
+
+  time_step: 60.0       # 每步时间间隔（秒）
+  num_steps: 100        # 每条轨迹步数
+
+  motion_models: ["CV", "CA"]
+  speeds_kmh: [20.0, 30.0, 40, 45, 55, 60]
+
+  dv_max_kmh: 20.0      # 总时长内理论上最多变化 20 km/h
+  accel_levels: [-1.0, 0.0, 1.0]
+
+  min_speed_kmh: 10.0
+
+  traj_types: ["straight", "left_turn", "right_turn", "s_curve"]
+
+  # 多种总转向角（度）
+  turn_total_deg_list: [15, 30.0, 45, 60.0, 75, 90.0, 120]
+
+  # 左/右转开始点系数（0~1），用 (num_steps-1)*coeff 取整
+  turn_start_coeffs: [ 0.3, 0.5, 0.7, 0.9]
+
+  # S 弯左转段的开始/结束位置系数对（0~1）
+  # 例如：在 [0.2,0.7] 区间内从 base_heading 左转到 base_heading+θ，再在 [0.7,1.0] 内右转回去
+  s_left_coeff_pairs:
+    - [0.2, 0.7]
+    - [0.5, 0.9]
+    - [0.3, 0.8]
+    - [0.3, 0.5]
+
+  # 兼容旧写法的绝对索引（现在用不上也可以保留）
+  s_left_start: 33
+  s_left_end: 66
+
+  num_traj_per_combo: 5
+
+  init_x_range: [-30.0, 30.0]
+  init_y_range: [-30.0, 30.0]
+  init_z_range: [0.0, 0.0]
+
+  use_vertical_motion: false
+  vertical_vz_range_kmps: [-0.005, 0.005]
+
+  random_seed: 42
+
+  speed_noise_kmh: 2.0
+  accel_noise_rel: 0.3
+
+
+  # traj_dataset
+  processed_dir: "data/processed"
+  scaler_filename: "scaler_posvel.npz"
+
+  in_len: 20
+  out_len: 10
+
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1   # 剩下的给 test，用这三个算出来
+
+  use_delta: true       # 位置改成“相邻步增量”
+  normalize: true       # 对 6 维特征做标准化
+
+model:
+  type: "lstm"
+  input_size: 6       # [x,y,z,vx,vy,vz]
+  output_size: 6
+  hidden_size: 256
+  num_layers: 2
+  out_len: 10         # 必须和 data.out_len 一致
+  dropout: 0.0
+  bidirectional: false
+
+train:
+  device_target: "CPU"    # 或 "CPU" / "Ascend"
+  mode: "GRAPH"           # 或 "PYNATIVE"
+  seed: 42
+
+  batch_size: 64
+  num_epochs: 10
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+
+  # MTP loss 超参数
+  alpha_class: 0.05
+  tau_p: 2.0
+  tau_d: 1.0
+  use_soft_assignment: true   # false 则为 WTA 模式
+
+  ckpt_dir: "checkpoints"
+  log_interval: 100

@@ -1,0 +1,36 @@
+# =============================================================================
+# gnn2 配置（骨架占位）
+# =============================================================================
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+context:
+  target_task_dim: 8
+  n_fixed_targets: 4
+  fixed_target_dim: 4
+  target_type_dim: 4
+  road_network_dim: 16
+  own_info_dim: 4
+
+model:
+  type: "gnn2_mlp_stub"     # TODO: "strike_zone_gnn"
+  fut_len: 10
+  feat_dim: 6
+  intent_feat_dim: 4         # 与 LSTM2.num_intent_classes 对齐
+  hidden_size: 128
+  dropout: 0.0
+
+train:
+  device: "auto"
+  seed: 42
+  batch_size: 64
+  num_epochs: 10
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  ckpt_dir: "checkpoints"
+  log_interval: 100

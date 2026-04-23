@@ -1,0 +1,23 @@
+norm_A_npz: "../203_prediction_multi_pytorch_without_map_v0.2/data/processed/scaler_posvel.npz"
+norm_B_npz: "../203_prediction_intention_pytorch_v0/data/processed/scaler_intent_posvel.npz"
+
+full_net:
+  n_modes: 3
+  fut_len: 10
+  feature_dim: 6
+  hist_len: 20
+  use_traj_logits: true
+  flatten_output: true
+  intent_index: 0
+  threat_index: 1
+  threat_use_sigmoid: true
+  strike_radius_base: 0.5
+  strike_radius_scale: 0.01
+  strike_radius_min: 0.5
+  strike_radius_max: 5.0
+  idx_lon: 0
+  idx_lat: 1
+  idx_alt: 2
+  idx_vn: 3
+  idx_ve: 4
+  idx_vu: 5
