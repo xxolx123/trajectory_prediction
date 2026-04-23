@@ -26,7 +26,7 @@ data:
 
   # ===================== 速度曲线采样 =====================
   speed_segments_range: [1, 4]    # 分几段
-  speed_jitter_kmh: 2.0           # 每步高斯抖动 std
+  speed_jitter_kmh: 1.0           # 每步高斯抖动 std
   allow_stop: false               # 是否允许某段强制停车
   stop_prob: 0.05                 # 若 allow_stop，触发概率
 
@@ -97,17 +97,40 @@ model:
   out_len: 10          # 必须和 data.out_len 一致
   dropout: 0.0
   bidirectional: false
-  modes: 3             # M 条候选轨迹
+  modes: 5             # M 条候选轨迹
 
 train:
   device: "auto"       # "cuda" / "cpu" / "mps" / "auto"
   seed: 42
 
-  batch_size: 64
-  num_epochs: 10
+  batch_size: 128
+  num_epochs: 25
 
-  lr: 1.0e-3
+  lr: 1.5e-3
   weight_decay: 1.0e-5
 
+  grad_clip: 1.0       # LSTM 梯度裁剪上限（0 表示不裁，推荐 1.0）
+
   ckpt_dir: "checkpoints"
+  keep_top_k: 5        # 每个 run 最多保留 val_loss 最低的前 K 个 ckpt
   log_interval: 100
+
+loss:
+  # === mode 选择策略 ===
+  # "hard"：经典 MTP 硬 WTA（Cui et al. 2019），推荐用来产生视觉上明显不同的多模态。
+  #         每个样本只推动最接近的 mode，模仿 k-means 的"专业化分工"。
+  #         和 old_plan/loss_mtp.py 的行为一致（唯一差别：不带 CE 分类损失）。
+  # "soft"：Soft-WTA。所有 mode 都被拉向同一个目标，适合单模态数据但不产生多模态。
+  # "topk"：前 k 小 mode 都拿梯度。
+  mode_selection: "hard"
+  soft_temperature: 1.0    # soft 时用
+  top_k: 2                 # topk 时用
+
+  # === Diversity 正则（可选，硬 WTA 下通常不需要开）===
+  # 如果硬 WTA 下出现"dead mode"（winner_frac 某个维长期 < 0.05），说明该
+  # mode 从未赢过，把它唤醒的办法是开一点 diversity_weight。
+  #   weight=0.0    关闭（推荐默认，硬 WTA 自然会分化）
+  #   weight=0.05   轻微唤醒 dead mode
+  #   weight>=0.3   强行推开，可能让部分 mode 偏离合理区
+  diversity_weight: 0.0
+  diversity_margin: 1.0

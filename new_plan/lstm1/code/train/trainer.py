@@ -48,7 +48,7 @@ if CODE_DIR not in sys.path:
 
 # data.traj_dataset 依赖 pandas；--smoke 不需要，所以延迟到 train() 内 import
 from train.model import build_model_from_config                 # noqa: E402
-from train.loss import TrajLoss, TrajLossConfig                 # noqa: E402
+from train.loss import TrajLoss, TrajLossConfig, build_loss_from_config  # noqa: E402
 
 
 # ====================== 工具函数 ======================
@@ -104,48 +104,94 @@ def train_one_epoch(
     device: torch.device,
     epoch_idx: int,
     log_interval: int = 100,
-) -> float:
+    grad_clip: float = 0.0,
+    num_modes: int = 3,
+) -> Dict[str, float]:
     """
     单个 epoch 的训练循环。
 
-    返回：
-      avg_loss: 当前 epoch 的平均训练 loss（Python float）
+    返回字典：
+      avg_loss       : 本 epoch 平均训练 loss
+      winner_frac    : 长度 M 的列表，每个 mode 在本 epoch 成为 argmin 的比例
+                       （若严重偏离 1/M，提示 mode collapse）
+      grad_norm_mean : 裁剪前的平均梯度 L2 范数
     """
     model.train()
 
     total_loss = 0.0
+    total_reg = 0.0
+    total_div = 0.0
+    total_div_raw = 0.0
     total_batches = 0
+    total_samples = 0
+    winner_counts = torch.zeros(num_modes, dtype=torch.long, device=device)
+    grad_norm_sum = 0.0
     t0 = time.time()
 
     for step_idx, batch in enumerate(train_loader, start=1):
-        # DataLoader 默认会把 numpy 自动转成 Tensor，
-        # 但这里我们依然 to(device).float() 保守一些。
         inputs, targets = batch  # inputs:[B,in_len,D]  targets:[B,out_len,D]
         inputs = inputs.to(device).float()
         targets = targets.to(device).float()
 
         optimizer.zero_grad()
 
-        # LSTM1：只输出 pred_trajs，概率由下游 GNN1 算
         pred_trajs = model(inputs)                     # [B,M,T,D]
-        loss = loss_fn(pred_trajs, targets)            # 标量 Tensor
-
+        # loss_fn 统一走 return_components=True，方便监控
+        loss, comps = loss_fn(pred_trajs, targets)
         loss.backward()
+        total_reg += float(comps["L_reg"].detach().cpu().item())
+        total_div += float(comps["L_div"].detach().cpu().item())
+        total_div_raw += float(comps["div_raw"].detach().cpu().item())
+
+        # ---- 梯度裁剪（LSTM 防爆炸） ----
+        if grad_clip and grad_clip > 0:
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=grad_clip
+            )
+        else:
+            # 即使不裁剪也记一下梯度范数，便于观察
+            with torch.no_grad():
+                total_norm = torch.sqrt(
+                    sum(
+                        (p.grad.detach() ** 2).sum()
+                        for p in model.parameters()
+                        if p.grad is not None
+                    )
+                )
+        grad_norm_sum += float(total_norm)
+
         optimizer.step()
 
+        # ---- 统计 ----
         loss_val = float(loss.detach().cpu().item())
         total_loss += loss_val
         total_batches += 1
+        B = int(inputs.size(0))
+        total_samples += B
+        winner_counts += comps["winner_counts"].to(winner_counts.device)
 
         if log_interval > 0 and (step_idx % log_interval == 0):
             elapsed = time.time() - t0
             print(
                 f"[Epoch {epoch_idx:03d}] step {step_idx:05d}, "
-                f"loss = {loss_val:.6f}, elapsed = {elapsed:.1f}s"
+                f"loss = {loss_val:.6f}, |grad| = {float(total_norm):.3f}, "
+                f"elapsed = {elapsed:.1f}s"
             )
 
-    avg_loss = total_loss / max(1, total_batches)
-    return avg_loss
+    winner_frac = (
+        (winner_counts.float() / max(1, total_samples)).detach().cpu().tolist()
+    )
+    nb = max(1, total_batches)
+    avg_loss = total_loss / nb
+    grad_norm_mean = grad_norm_sum / nb
+    return {
+        "avg_loss": avg_loss,
+        "avg_reg": total_reg / nb,
+        "avg_div": total_div / nb,
+        "avg_div_raw": total_div_raw / nb,
+        "winner_frac": winner_frac,
+        "grad_norm_mean": grad_norm_mean,
+    }
 
 
 def evaluate(
@@ -154,14 +200,15 @@ def evaluate(
     val_loader: DataLoader,
     device: torch.device,
     epoch_idx: int,
-) -> float:
-    """
-    在验证集上评估平均 loss。
-    """
+    num_modes: int = 3,
+) -> Dict[str, float]:
+    """在验证集上评估平均 loss + winner 分布。"""
     model.eval()
 
     total_loss = 0.0
     total_batches = 0
+    total_samples = 0
+    winner_counts = torch.zeros(num_modes, dtype=torch.long, device=device)
 
     with torch.no_grad():
         for batch in val_loader:
@@ -170,30 +217,76 @@ def evaluate(
             targets = targets.to(device).float()
 
             pred_trajs = model(inputs)
-            loss = loss_fn(pred_trajs, targets)
+            loss, comps = loss_fn(pred_trajs, targets)
 
-            loss_val = float(loss.detach().cpu().item())
-            total_loss += loss_val
+            total_loss += float(loss.detach().cpu().item())
             total_batches += 1
+            total_samples += int(inputs.size(0))
+            winner_counts += comps["winner_counts"].to(winner_counts.device)
 
     avg_loss = total_loss / max(1, total_batches)
-    print(f"[Epoch {epoch_idx:03d}] Validation loss = {avg_loss:.6f}")
-    return avg_loss
+    winner_frac = (
+        (winner_counts.float() / max(1, total_samples)).detach().cpu().tolist()
+    )
+    print(
+        f"[Epoch {epoch_idx:03d}] Val loss = {avg_loss:.6f}, "
+        f"winner_frac = [{', '.join(f'{w:.3f}' for w in winner_frac)}]"
+    )
+    return {"avg_loss": avg_loss, "winner_frac": winner_frac}
 
 
-def save_best_checkpoint(
+def maybe_save_topk_checkpoint(
     model: nn.Module,
     ckpt_dir: Path,
     epoch_idx: int,
     val_loss: float,
-) -> None:
+    saved_ckpts: "list[tuple[float, int, Path]]",
+    keep_top_k: int,
+) -> bool:
     """
-    保存当前最优模型 checkpoint（只保存 model.state_dict）。
+    动态维护 top-K 个最优 checkpoint：
+      - 当前 val_loss 进入 top-K（列表未满 或 优于列表末尾最差者）才保存；
+      - 保存后按 val_loss 升序排序，pop 掉末尾超出 K 的，并把对应文件删掉。
+
+    `saved_ckpts` 会被**原地修改**，保存了 (val_loss, epoch, path)。
+
+    返回：True 表示本 epoch 新保存了一个 ckpt（不管有没有淘汰），False 表示未保存。
     """
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # 先判断值不值得保存
+    qualifies = len(saved_ckpts) < keep_top_k or val_loss < saved_ckpts[-1][0]
+    if not qualifies:
+        return False
+
+    # 保存
     ckpt_path = ckpt_dir / f"best_lstm_epoch{epoch_idx:03d}_valloss{val_loss:.4f}.pt"
     torch.save(model.state_dict(), ckpt_path)
-    print(f"[Checkpoint] Saved best model to: {ckpt_path}")
+    saved_ckpts.append((val_loss, epoch_idx, ckpt_path))
+    saved_ckpts.sort(key=lambda x: x[0])  # val_loss 升序
+
+    # 淘汰超出 K 的
+    while len(saved_ckpts) > keep_top_k:
+        worst_loss, worst_epoch, worst_path = saved_ckpts.pop()
+        try:
+            if worst_path.exists():
+                worst_path.unlink()
+            print(
+                f"[Checkpoint] Dropped worse ckpt: {worst_path.name} "
+                f"(val_loss={worst_loss:.6f})"
+            )
+        except OSError as e:
+            print(f"[Checkpoint][WARN] Failed to remove {worst_path}: {e}")
+
+    # 打印当前 top-K
+    top_desc = ", ".join(
+        f"ep{e}:{l:.4f}" for l, e, _ in saved_ckpts
+    )
+    print(
+        f"[Checkpoint] Saved {ckpt_path.name} | "
+        f"Top-{keep_top_k}: [{top_desc}]"
+    )
+    return True
 
 
 # ====================== 总控：train() ======================
@@ -259,9 +352,12 @@ def train(config_path: str) -> None:
     print("[Info] Building model (LSTM1 multi-modal forecaster, no mode_logits) ...")
     model = build_model_from_config(cfg).to(device)
 
-    # 多模态 WTA TrajLoss（只剩回归项）
-    loss_cfg = TrajLossConfig(return_components=False)
-    loss_fn = TrajLoss(loss_cfg)
+    # 多模态 TrajLoss（默认 soft-WTA，可在 config.loss 里切换）
+    loss_fn = build_loss_from_config(cfg)
+    print(
+        f"[Info] Loss: mode_selection={loss_fn.cfg.mode_selection}"
+        f"{'（T=' + str(loss_fn.cfg.soft_temperature) + '）' if loss_fn.cfg.mode_selection == 'soft' else ''}"
+    )
 
     # ==== 优化器 ====
     lr = float(train_cfg.get("lr", 1e-3))
@@ -276,6 +372,9 @@ def train(config_path: str) -> None:
     # ==== 训练循环 ====
     num_epochs = int(train_cfg.get("num_epochs", 50))
     log_interval = int(train_cfg.get("log_interval", 100))
+    grad_clip = float(train_cfg.get("grad_clip", 1.0))  # LSTM 默认裁 1.0
+
+    num_modes = int(cfg.get("model", {}).get("modes", 3))
 
     # ---- 新增：以训练开始时间设置一个 run 目录 ----
     # 格式：YYYYmmddHHMMSS，例如 20251119171508
@@ -284,8 +383,14 @@ def train(config_path: str) -> None:
     ckpt_root = (project_root / ckpt_root_str).resolve()
     ckpt_dir = ckpt_root / run_id
 
-    print(f"[Info] Checkpoints will be saved under: {ckpt_dir}")
+    keep_top_k = int(train_cfg.get("keep_top_k", 3))
+    print(
+        f"[Info] Checkpoints will be saved under: {ckpt_dir} "
+        f"(keep top-{keep_top_k})"
+    )
 
+    # 动态维护的 top-K 列表：每项 = (val_loss, epoch, path)
+    saved_ckpts: list = []
     best_val_loss = float("inf")
     best_epoch = -1
 
@@ -293,7 +398,7 @@ def train(config_path: str) -> None:
         print(f"\n========== Epoch {epoch}/{num_epochs} ==========")
 
         t_epoch_start = time.time()
-        train_loss = train_one_epoch(
+        train_stats = train_one_epoch(
             model=model,
             loss_fn=loss_fn,
             optimizer=optimizer,
@@ -301,37 +406,59 @@ def train(config_path: str) -> None:
             device=device,
             epoch_idx=epoch,
             log_interval=log_interval,
+            grad_clip=grad_clip,
+            num_modes=num_modes,
         )
         t_epoch_end = time.time()
 
+        train_loss = train_stats["avg_loss"]
+        winner_frac = train_stats["winner_frac"]
+        grad_norm_mean = train_stats["grad_norm_mean"]
+        avg_reg = train_stats["avg_reg"]
+        avg_div = train_stats["avg_div"]
+        avg_div_raw = train_stats["avg_div_raw"]
+
         print(
-            f"[Epoch {epoch:03d}] Train loss = {train_loss:.6f}, "
+            f"[Epoch {epoch:03d}] Train loss = {train_loss:.6f} "
+            f"(reg={avg_reg:.6f}, div={avg_div:.6f}, div_raw={avg_div_raw:.4f}), "
+            f"winner_frac = [{', '.join(f'{w:.3f}' for w in winner_frac)}], "
+            f"mean |grad| = {grad_norm_mean:.3f}, "
             f"epoch time = {t_epoch_end - t_epoch_start:.1f}s"
         )
 
         # 验证
-        val_loss = evaluate(
+        val_stats = evaluate(
             model=model,
             loss_fn=loss_fn,
             val_loader=val_loader,
             device=device,
             epoch_idx=epoch,
+            num_modes=num_modes,
         )
+        val_loss = val_stats["avg_loss"]
 
-        # 保存最优模型（都会丢进 ckpt_dir = checkpoints/<run_id> 里）
+        # 动态维护 top-K 个 ckpt：新 ckpt 进入 top-K 才保存，超出 K 的自动淘汰
+        maybe_save_topk_checkpoint(
+            model=model,
+            ckpt_dir=ckpt_dir,
+            epoch_idx=epoch,
+            val_loss=val_loss,
+            saved_ckpts=saved_ckpts,
+            keep_top_k=keep_top_k,
+        )
+        # 更新"历史最好"（仅用于训练结束时的总结打印）
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            save_best_checkpoint(model, ckpt_dir, epoch, val_loss)
-            print(
-                f"[Best] Updated best model: epoch={best_epoch}, "
-                f"val_loss={best_val_loss:.6f}"
-            )
 
     print(
         f"\n[Training Finished] Best epoch = {best_epoch}, "
         f"best val_loss = {best_val_loss:.6f}"
     )
+    if saved_ckpts:
+        print(f"[Training Finished] Top-{keep_top_k} checkpoints:")
+        for rank, (loss, ep, path) in enumerate(saved_ckpts, start=1):
+            print(f"  #{rank}  epoch={ep:03d}  val_loss={loss:.6f}  {path.name}")
 
 
 # ====================== 冒烟测试 --smoke ======================
@@ -370,13 +497,26 @@ def run_smoke(cfg: Dict[str, Any]) -> None:
     assert pred.shape == expected, f"shape 不对: {tuple(pred.shape)} vs {expected}"
     print(f"[Smoke/LSTM1] forward OK, output shape = {tuple(pred.shape)}")
 
-    loss_fn = TrajLoss(TrajLossConfig(return_components=False))
-    loss = loss_fn(pred, targets)
+    loss_fn = build_loss_from_config(cfg)
+    print(f"[Smoke/LSTM1] loss config: {loss_fn.cfg}")
+
+    loss, comps = loss_fn(pred, targets)
     print(f"[Smoke/LSTM1] loss = {float(loss):.4f}")
+    print(f"[Smoke/LSTM1] winner_counts = {comps['winner_counts'].tolist()}")
 
     loss.backward()
     lstm_has_grad = any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.parameters())
     print(f"[Smoke/LSTM1] gradients present? {lstm_has_grad}")
+
+    # 观察每个 mode 的 fc_traj 切片梯度：
+    #   hard WTA：只有 winner 的切片有较大梯度，其余接近 0
+    #   soft WTA：每个 mode 都有相近大小的梯度
+    fc_grad = model.fc_traj.weight.grad  # [M*T*D, fc_in]
+    if fc_grad is not None:
+        M, T_out, D = model.modes, model.out_len, model.output_size
+        per_mode_norm = fc_grad.view(M, T_out * D, -1).norm(dim=(1, 2)).tolist()
+        print(f"[Smoke/LSTM1] per-mode grad norm in fc_traj = "
+              f"{[f'{g:.4f}' for g in per_mode_norm]}")
 
     print("=" * 60)
     print("[Smoke/LSTM1] OK")

@@ -427,7 +427,7 @@ def build_datasets_from_config(
         f"(total={n_total})"
     )
 
-    # 3) 先构造“未增量、未归一化”的窗口
+    # 3) 先构造"未增量、未归一化"的窗口
     train_in, train_out = _make_windows_for_ids(df, train_ids, in_len, out_len)
     val_in, val_out = _make_windows_for_ids(df, val_ids, in_len, out_len)
     test_in, test_out = _make_windows_for_ids(df, test_ids, in_len, out_len)

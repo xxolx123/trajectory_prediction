@@ -272,7 +272,6 @@ def plot_example_trajectory_multi(
     gt_pos: np.ndarray,        # [Tout,2]
     pred_pos_all: np.ndarray,  # [M,Tout,2]
     best_mode: int,
-    probs: np.ndarray,         # [M]
     save_dir: Path,
     title: str = "",
 ) -> None:
@@ -281,6 +280,8 @@ def plot_example_trajectory_multi(
       - 历史 Tin 步
       - 真实未来 Tout 步
       - M 条预测未来 Tout 步（全部画出来），其中 best_mode 高亮。
+
+    LSTM1 不输出 mode 概率，所以图上不显示 p=xx，概率交给下游 GNN1。
     """
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -308,7 +309,7 @@ def plot_example_trajectory_multi(
                 marker="x",
                 linestyle="-",
                 linewidth=2.0,
-                label=f"Pred mode {m} (BEST, p={probs[m]:.2f})",
+                label=f"Pred mode {m} (BEST)",
             )
         else:
             plt.plot(
@@ -317,7 +318,7 @@ def plot_example_trajectory_multi(
                 linestyle="--",
                 linewidth=1.0,
                 alpha=0.6,
-                label=f"Pred mode {m} (p={probs[m]:.2f})",
+                label=f"Pred mode {m}",
             )
 
     Tin = len(hx)
@@ -349,7 +350,7 @@ def evaluate_loader(
     device: torch.device,
     scaler,
     use_delta: bool,
-) -> Tuple[float, float, float, float, float, float, float, float, float, float]:
+) -> Tuple:
     """
     在给定 DataLoader 上评估：
       - 平均 Net MSE（best-of-M，归一化空间）
@@ -378,6 +379,10 @@ def evaluate_loader(
     min_forward_batch = float("inf")
     max_forward_batch = 0.0
 
+    # 每个样本各指标的 per-sample 数组，最后拼起来统计分位数
+    all_min_ade: List[np.ndarray] = []
+    all_min_fde: List[np.ndarray] = []
+
     with torch.no_grad():
         for inputs_norm, targets_norm in loader:
             inputs_norm = inputs_norm.to(device).float()   # [B,Tin,D]
@@ -403,44 +408,70 @@ def evaluate_loader(
             # 调用 WTA 损失，看数值是否正常
             _ = loss_fn(pred_trajs_norm, targets_norm)
 
-            # ---- 计算 best-of-M 的归一化 MSE（和训练 winner 一致）----
-            # diff: [B,M,T,D]
+            # ---- 归一化 6D MSE（保留，和训练 winner 口径一致，但只作参考）----
             diff = pred_trajs_norm - targets_norm.unsqueeze(1)
-            mse_per_mode = (diff ** 2).mean(dim=(-1, -2))   # [B,M]
-            best_mode_idx = torch.argmin(mse_per_mode, dim=1)  # [B]
+            mse_per_mode = (diff ** 2).mean(dim=(-1, -2))          # [B, M]
 
-            # 当前 batch 的 MSE（先对样本取平均，再跨 batch 平均）
-            batch_best_mse = mse_per_mode[
-                torch.arange(mse_per_mode.size(0), device=device),
-                best_mode_idx
-            ].mean()   # 标量 Tensor
-            net_mse_val = float(batch_best_mse.detach().cpu().item())
-            total_net_mse += net_mse_val
+            # ============================================================
+            # best_mode 的挑选标准：xy-ADE 最小的那个 mode（而非 6D-MSE）。
+            # 后续 ADE / FDE / RelADE / RelFDE 全部用这个 mode 的预测计算，
+            # 和 old_plan 流程一致，仅 mode 选择准则不同。
+            # ============================================================
+            M = pred_trajs_norm.size(1)
+            _, Tin, _D = inputs_norm.shape
+            _, Tout, _ = targets_norm.shape
 
-            # ---- 位置空间指标：用 best mode 的预测 ----
-            batch_indices = torch.arange(B, device=device)
-            preds_best_norm = pred_trajs_norm[batch_indices, best_mode_idx]  # [B,Tout,D]
-
-            hist_pos, gt_pos, pred_pos = decode_batch_to_positions(
-                inputs_norm, targets_norm, preds_best_norm,
+            # 一次性 decode 所有 mode 到 xy 位置
+            preds_flat_norm = pred_trajs_norm.reshape(B * M, Tout, _D)
+            inputs_rep = (
+                inputs_norm.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, Tin, _D)
+            )
+            targets_rep = (
+                targets_norm.unsqueeze(1).expand(-1, M, -1, -1).reshape(B * M, Tout, _D)
+            )
+            hist_pos_flat, gt_pos_flat, pred_pos_flat = decode_batch_to_positions(
+                inputs_rep, targets_rep, preds_flat_norm,
                 scaler=scaler,
                 use_delta=use_delta,
                 pos_dims=(0, 1),
             )
+            pred_pos_per_mode = pred_pos_flat.reshape(B, M, Tout, 2)
+            hist_pos = hist_pos_flat.reshape(B, M, Tin, 2)[:, 0]   # [B, Tin, 2]
+            gt_pos = gt_pos_flat.reshape(B, M, Tout, 2)[:, 0]      # [B, Tout, 2]
 
-            pos_mse, ade, fde = compute_pos_metrics(pred_pos, gt_pos)
+            # per-mode ADE 用来挑 best_mode
+            dist_pm = np.linalg.norm(
+                pred_pos_per_mode - gt_pos[:, None, :, :], axis=-1
+            )                                              # [B, M, Tout]
+            ade_pm = dist_pm.mean(axis=-1)                 # [B, M]
+            best_mode = np.argmin(ade_pm, axis=1)          # [B]
+
+            # 被挑中那一 mode 的预测 + 6D MSE（按 xy-ADE 的 best 对应的 mode）
+            batch_idx = np.arange(B)
+            pred_pos_best = pred_pos_per_mode[batch_idx, best_mode]   # [B, Tout, 2]
+
+            # Net MSE 用训练 winner（6D argmin），作训练口径参考
+            best_6d = torch.argmin(mse_per_mode, dim=1)
+            total_net_mse += float(
+                mse_per_mode[torch.arange(B, device=device), best_6d].mean().cpu().item()
+            )
+
+            # === 按 old_plan 的单 mode 流程算 ADE / FDE / RelADE / RelFDE ===
+            pos_mse, ade, fde = compute_pos_metrics(pred_pos_best, gt_pos)
             total_pos_mse += pos_mse
             total_ade += ade
             total_fde += fde
 
-            # ---- 相对误差：delta_x / x * 100% ----
-            # x：GT 每步的位移长度（上一时刻 GT -> 当前 GT）
-            # delta_x：当前步预测位置与 GT 位置的距离
-            batch_rel_err, batch_rel_fde = compute_relative_errors(
-                hist_pos, gt_pos, pred_pos
+            rel_err, rel_fde = compute_relative_errors(
+                hist_pos, gt_pos, pred_pos_best
             )
-            total_rel_err += batch_rel_err
-            total_rel_fde += batch_rel_fde
+            total_rel_err += rel_err
+            total_rel_fde += rel_fde
+
+            # 收集样本级 minADE/minFDE（这里是"被选中 mode 的 ADE/FDE"）供分位数统计
+            all_min_ade.append(ade_pm[batch_idx, best_mode].copy())
+            fde_pm = dist_pm[..., -1]                      # [B, M]
+            all_min_fde.append(fde_pm[batch_idx, best_mode].copy())
 
             total_batches += 1
 
@@ -460,6 +491,16 @@ def evaluate_loader(
         min_forward_batch = 0.0
         max_forward_batch = 0.0
 
+    # 分位数统计（基于样本级 minADE / minFDE）
+    if all_min_ade:
+        min_ade_all = np.concatenate(all_min_ade)
+        min_fde_all = np.concatenate(all_min_fde)
+        quantiles = np.percentile(min_ade_all, [10, 25, 50, 75, 90, 95])
+        quantiles_fde = np.percentile(min_fde_all, [10, 25, 50, 75, 90, 95])
+    else:
+        quantiles = np.zeros(6)
+        quantiles_fde = np.zeros(6)
+
     return (
         avg_net_mse,
         avg_pos_mse,
@@ -471,6 +512,8 @@ def evaluate_loader(
         max_forward_batch,
         avg_rel_err,
         avg_rel_fde,
+        quantiles,        # [10, 25, 50, 75, 90, 95] 百分位的 minADE (km)
+        quantiles_fde,    # 同上 minFDE
     )
 
 
@@ -517,15 +560,8 @@ def plot_random_trajectory(
 
     B, M, Tout, D = pred_trajs_norm.shape
 
-    # ---- 对该样本选 best mode（按 MSE 最小）----
-    diff = pred_trajs_norm - targets_norm.unsqueeze(1)     # [1,M,T,D]
-    mse_per_mode = (diff ** 2).mean(dim=(-1, -2))          # [1,M]
-    best_mode_idx = torch.argmin(mse_per_mode, dim=1)      # [1]
-    m_best = int(best_mode_idx.item())
-
-    # LSTM1 不再产出 mode_logits；这里为了可视化用"均匀分布 + best mode 标亮"。
-    # 实际多模态概率留给下游 GNN1 计算。
-    probs = np.full((M,), 1.0 / max(M, 1), dtype=np.float32)
+    # LSTM1 不再产出 mode_logits；概率交给下游 GNN1，可视化不显示概率。
+    # best_mode 会在反归一化到 xy 后基于"xy 距离"选取（和 minADE 口径一致）。
 
     # ---- 反归一化 + Δ→绝对位置 ----
     # 先算历史 + GT（只有一份，和 mode 无关）
@@ -556,9 +592,16 @@ def plot_random_trajectory(
 
     pred_pos_all = np.stack(pred_pos_all, axis=0)  # [M,Tout,2]
 
+    # 按 xy 距离选 best mode：
+    #   每个 mode 对 GT 的 ADE（平均 L2 距离）
+    per_mode_ade = np.linalg.norm(
+        pred_pos_all - gt_pos_1[None, :, :], axis=-1
+    ).mean(axis=-1)                       # [M]
+    m_best = int(np.argmin(per_mode_ade))
+
     title = (
         f"Random sample idx={idx}, split={split}, "
-        f"best_mode={m_best}, prob={probs[m_best]:.3f}"
+        f"best_mode={m_best} (ADE={per_mode_ade[m_best]:.4f} km)"
     )
 
     # 画多模态版本（所有 mode）
@@ -567,7 +610,6 @@ def plot_random_trajectory(
         gt_pos_1,
         pred_pos_all,
         best_mode=m_best,
-        probs=probs,
         save_dir=save_dir,
         title=title,
     )
@@ -670,22 +712,34 @@ def evaluate(config_path: str, ckpt_path: Optional[str] = None, split: str = "te
         max_forward_batch,
         avg_rel_err,
         avg_rel_fde,
+        quantiles_ade,
+        quantiles_fde,
     ) = evaluate_loader(
-        model, loss_fn, eval_loader, device, scaler, use_delta
+        model, loss_fn, eval_loader, device, scaler, use_delta,
     )
     elapsed = time.time() - t_start
 
     print("\n========== Evaluation ==========")
     print(f"Split                          = {split}")
-    # print(f"Net MSE (best-of-M, norm 6D)   = {avg_net_mse:.6f}")
-    # print(f"Pos MSE (x,y, km^2)            = {avg_pos_mse:.6f}")
-    print(f"ADE (km, best-of-M)            = {avg_ade:.6f}")
-    # print(f"ADE (m, best-of-M)             = {avg_ade * 1000:.3f}")
-    print(f"FDE (km, best-of-M)            = {avg_fde:.6f}")
-    # print(f"FDE (m, best-of-M)             = {avg_fde * 1000:.3f}")
-    print(f"Rel ADE (%, best-of-M)         = {avg_rel_err:.2f}")
-    print(f"Rel FDE (%, best-of-M)         = {avg_rel_fde:.2f}")
-    print(f"Elapsed time (whole eval)      = {elapsed:.1f}s")
+    # 每个样本按 xy-ADE 最小挑出一个 best_mode，再用它的预测算四个指标。
+    # 因此 ADE = minADE；FDE / RelADE / RelFDE 是"该 best_mode 对应的值"。
+    print(f"ADE (km, min-ADE mode)         = {avg_ade:.6f}")
+    print(f"FDE (km, min-ADE mode)         = {avg_fde:.6f}")
+    print(f"ADE (m, min-ADE mode)          = {avg_ade * 1000:.3f}")
+    print(f"FDE (m, min-ADE mode)          = {avg_fde * 1000:.3f}")
+    print(f"Rel ADE (%, min-ADE mode)      = {avg_rel_err:.2f}")
+    print(f"Rel FDE (%, min-ADE mode)      = {avg_rel_fde:.2f}")
+    print(f"Net MSE (6D-best, norm)        = {avg_net_mse:.6f}  # 训练口径参考")
+
+    # 分位数：看 per-sample ADE / FDE 的分布，对判断"是不是被少数难样本拉高"很有用
+    print("\n--- Distribution of per-sample ADE (km, min-ADE mode) ---")
+    print(f"  p10   p25   p50   p75   p90   p95")
+    print("  " + "  ".join(f"{v:.3f}" for v in quantiles_ade))
+    print("--- Distribution of per-sample FDE (km, min-ADE mode) ---")
+    print(f"  p10   p25   p50   p75   p90   p95")
+    print("  " + "  ".join(f"{v:.3f}" for v in quantiles_fde))
+
+    print(f"\nElapsed time (whole eval)      = {elapsed:.1f}s")
 
     # ====== 关注的：单次预测耗时（只算 model forward） ======
     print("\n------ Forward timing (model only) ------")
