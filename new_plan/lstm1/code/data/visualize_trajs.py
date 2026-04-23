@@ -89,7 +89,17 @@ def load_trajectories(csv_path: str):
     for traj_id, info in traj_dict.items():
         info["steps"].sort(key=lambda v: v[3])
 
-    traj_types = sorted(traj_types_set)
+    # 按"语义顺序"展示，未知类型按字母序追加在后面
+    preferred_order = [
+        "straight",
+        "left_turn",
+        "right_turn",
+        "u_turn",
+        "s_curve",
+    ]
+    in_csv = set(traj_types_set)
+    traj_types = [t for t in preferred_order if t in in_csv]
+    traj_types += sorted(in_csv - set(traj_types))
     return traj_dict, traj_types
 
 

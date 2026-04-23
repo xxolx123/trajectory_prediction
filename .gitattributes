@@ -1,0 +1,68 @@
+# 默认：自动识别文本/二进制
+* text=auto
+
+# ---------------- Git 自身的配置文件 ----------------
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+.gitmodules     text eol=lf
+
+# ---------------- 源代码 / 配置（统一用 LF） ----------------
+*.py        text eol=lf
+*.pyi       text eol=lf
+*.ipynb     text eol=lf
+
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+
+*.md        text eol=lf
+*.txt       text eol=lf
+*.rst       text eol=lf
+*.csv       text eol=lf
+*.tsv       text eol=lf
+
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+
+# ---------------- Windows 专属脚本保持 CRLF ----------------
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# ---------------- 二进制（Git 不要碰换行符） ----------------
+*.npz       binary
+*.npy       binary
+*.pt        binary
+*.pth       binary
+*.ckpt      binary
+*.h5        binary
+*.hdf5      binary
+*.pkl       binary
+*.pickle    binary
+*.onnx      binary
+*.pb        binary
+*.tflite    binary
+
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.bmp       binary
+*.ico       binary
+*.svg       text eol=lf
+*.pdf       binary
+
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.7z        binary
+*.rar       binary
+
+*.xlsx      binary
+*.xls       binary
+*.docx      binary
+*.doc       binary

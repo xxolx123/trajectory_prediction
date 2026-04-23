@@ -1,40 +1,68 @@
 data:
+  # ===================== 输出路径 =====================
   raw_dir: "data/raw"
   output_csv: "synthetic_trajectories.csv"
 
-  time_step: 60.0       # 每步时间间隔（秒）
-  num_steps: 100        # 每条轨迹步数
+  # ===================== 基本时间尺度 =====================
+  time_step: 60.0        # 每步时间间隔（秒）
+  num_steps: 100         # 每条轨迹步数（可按场景调小到 30~60）
 
-  motion_models: ["CV", "CA"]
-  speeds_kmh: [20.0, 30.0, 40, 45, 55, 60]
+  # ===================== 5 类标签 & 每类样本数 =====================
+  traj_types: ["straight", "left_turn", "right_turn", "s_curve", "u_turn"]
 
-  dv_max_kmh: 20.0      # 总时长内理论上最多变化 20 km/h
-  accel_levels: [-1.0, 0.0, 1.0]
+  num_traj_per_type:
+    straight: 800
+    left_turn: 800
+    right_turn: 800
+    s_curve: 800
+    u_turn: 800
 
-  min_speed_kmh: 10.0
+  # ===================== 车辆动力学上限 =====================
+  speed_range_kmh: [15.0, 60.0]   # 速度采样区间
+  min_speed_kmh: 10.0             # 裁剪下限（stop 段除外）
+  max_accel_mps2: 0.8             # 普通乘用车舒适加速
+  max_decel_mps2: 1.5             # 刹车可更硬
+  max_yaw_rate_deg_s: 20.0        # 每秒最大偏航速率
 
-  traj_types: ["straight", "left_turn", "right_turn", "s_curve"]
+  # ===================== 速度曲线采样 =====================
+  speed_segments_range: [1, 4]    # 分几段
+  speed_jitter_kmh: 2.0           # 每步高斯抖动 std
+  allow_stop: false               # 是否允许某段强制停车
+  stop_prob: 0.05                 # 若 allow_stop，触发概率
 
-  # 多种总转向角（度）
-  turn_total_deg_list: [15, 30.0, 45, 60.0, 75, 90.0, 120]
+  # ===================== 每类 yaw-rate 采样 =====================
+  straight:
+    # 直线类：完全直线，默认不加任何偏航漂移。
+    # 注意 drift 是"每秒偏航率 std (deg/s)"，会乘以 time_step=60s 累加到
+    # heading 上，所以即使 0.2 也会让直线明显蛇形。需要时再小心开启。
+    heading_drift_deg_s: 0.0
 
-  # 左/右转开始点系数（0~1），用 (num_steps-1)*coeff 取整
-  turn_start_coeffs: [ 0.3, 0.5, 0.7, 0.9]
+  turn:                           # left_turn / right_turn 共用
+    n_turns_range: [1, 3]         # 每条轨迹几次转向
+    angle_range_deg: [20.0, 120.0]
+    duration_range_steps: [5, 40] # 每次转向持续多少步
+    min_gap_steps: 3              # 段间 / 边界 最少保留的直线步
+    straight_drift_deg_s: 0.0     # 非转向段的方向漂移（0 即纯直线）
 
-  # S 弯左转段的开始/结束位置系数对（0~1）
-  # 例如：在 [0.2,0.7] 区间内从 base_heading 左转到 base_heading+θ，再在 [0.7,1.0] 内右转回去
-  s_left_coeff_pairs:
-    - [0.2, 0.7]
-    - [0.5, 0.9]
-    - [0.3, 0.8]
-    - [0.3, 0.5]
+  s_curve:
+    n_segments_range: [2, 4]      # 交替段数（>=2）
+    angle_range_deg: [20.0, 90.0]
+    segment_len_range_steps: [8, 30]
+    gap_steps_range: [0, 5]
+    first_direction: "random"     # "left" / "right" / "random"
+    drift_deg_s: 0.0
 
-  # 兼容旧写法的绝对索引（现在用不上也可以保留）
-  s_left_start: 33
-  s_left_end: 66
+  u_turn:
+    # 一次 ~180° 的大转向（掉头）。duration 限制在 <= in_len (20) 步，
+    # 以便"完整 U 形"能装进训练窗口而被模型学到。
+    n_turns_range: [1, 1]         # 每条只掉一次头（设 [1,2] 允许"去-回"）
+    angle_range_deg: [150.0, 210.0]
+    duration_range_steps: [6, 18]
+    min_gap_steps: 10             # 掉头前后至少各留 10 步直线
+    direction: "random"           # "left" / "right" / "random"
+    straight_drift_deg_s: 0.0
 
-  num_traj_per_combo: 5
-
+  # ===================== 初始位姿 =====================
   init_x_range: [-30.0, 30.0]
   init_y_range: [-30.0, 30.0]
   init_z_range: [0.0, 0.0]
@@ -42,13 +70,11 @@ data:
   use_vertical_motion: false
   vertical_vz_range_kmps: [-0.005, 0.005]
 
+  # ===================== 随机种子 =====================
   random_seed: 42
+  # split_seed: 42   # 可选：仅 traj_dataset.py 的分层划分单独指定；默认用 random_seed
 
-  speed_noise_kmh: 2.0
-  accel_noise_rel: 0.3
-
-
-  # traj_dataset
+  # ===================== traj_dataset 相关 =====================
   processed_dir: "data/processed"
   scaler_filename: "scaler_posvel.npz"
 
@@ -57,24 +83,24 @@ data:
 
   train_ratio: 0.8
   val_ratio: 0.1
-  test_ratio: 0.1   # 剩下的给 test，用这三个算出来
+  test_ratio: 0.1
 
-  use_delta: true       # 位置改成“相邻步增量”
-  normalize: true       # 对 6 维特征做标准化
+  use_delta: true        # 位置改成"相邻步增量"
+  normalize: true        # 对 6 维特征做标准化
 
 model:
   type: "lstm"
-  input_size: 6       # [x,y,z,vx,vy,vz]
+  input_size: 6        # [x,y,z,vx,vy,vz]
   output_size: 6
   hidden_size: 256
   num_layers: 2
-  out_len: 10         # 必须和 data.out_len 一致
+  out_len: 10          # 必须和 data.out_len 一致
   dropout: 0.0
   bidirectional: false
-  modes: 3            # M 条候选轨迹
+  modes: 3             # M 条候选轨迹
 
 train:
-  device: "auto"      # "cuda" / "cpu" / "mps" / "auto"
+  device: "auto"       # "cuda" / "cpu" / "mps" / "auto"
   seed: 42
 
   batch_size: 64

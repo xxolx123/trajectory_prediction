@@ -1,80 +1,66 @@
 #!/usr/bin/env python3
 """
 generate_trajs.py
+-----------------
+车辆轨迹合成数据生成器（采样式，Per-sample 运动学积分）。
 
-- 运动模型：CV / CA
-- 速度档：可配置（如 20 / 30 / 50 km/h）
-- 加速度档：根据“总时长内最大变化 DV_MAX_KMH”自动算出三档加速度
-- 轨迹类型：直线 / 左转 / 右转 / S 型弯（只转一次，不再绕圈）
-
-新增：
-- 转向总角度列表：turn_total_deg_list: [30, 45, 60, 90]
-- 左右转开始点：turn_start_coeffs: [0.3, 0.5, 0.7]，按 (num_steps-1)*coeff 求索引
-- S 弯左转段用系数组对：s_left_coeff_pairs: [[0.2,0.7],[0.5,0.9],...]
-
-分布设计：
-- straight / left_turn / right_turn：
-    遍历 turn_total_deg_list × turn_start_coeffs（S 段用一个代表区间）
-- s_curve：
-    遍历 turn_total_deg_list × turn_start_coeffs × s_left_coeff_pairs
-  → S 弯样本相对更多；如果觉得过多可以减少 s_left_coeff_pairs 或减小 num_traj_per_combo
+相较旧版的关键变化：
+- 不再做 (motion_model × speed × accel × traj_type × angle × start_coeff × s_pair)
+  的穷举枚举，每条轨迹都独立采样一条"速度曲线 + 偏航率曲线"，再前向积分；
+- 保留 4 个 `traj_type` 标签，但每类内部的"转几次 / 转多少 / 何时转 / 速度怎么
+  变"全部连续采样，类内多样性显著提升；
+- 输出 CSV 的列保持不变，下游 `traj_dataset.py` / 训练代码不需要改动。
 
 单位：
-- 位置 x,y,z：km
-- 速度 vx,vy,vz：km/s
+- 位置 x,y,z: km
+- 速度 vx,vy,vz: km/s
+- 时间 step: 秒（`time_step`，默认 60s/步）
 
-Domain randomization：
-- 对同一 combo 内的每条轨迹，额外对以下量加噪声：
-    * 初始位置：init_x, init_y, init_z（均匀采样于给定范围）
-    * 初始方向：init_heading（均匀采样于 [0, 2π)）
-    * 初始速度：speed_kmh ± speed_noise_kmh
-    * 加速度（CA）：accel_mps2 × (1 ± accel_noise_rel)
-
-用法（在项目根目录）：
-    python -m code.data.generate_trajs --config config.yaml
+用法（在 `new_plan/lstm1/` 下）：
+    python -m data.generate_trajs --config config.yaml
+    # 小量预生成（覆盖 num_traj_per_type）：
+    python -m data.generate_trajs --config config.yaml --num-per-type 20
 """
 
 import math
 import csv
 import random
 import argparse
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
+import numpy as np
 import yaml
 
-# ======================= 全局参数（将由 config 填充） =========================
+# ======================= 全局参数（由 config 填充） =========================
 
 TIME_STEP: float
 NUM_STEPS: int
 
-MOTION_MODELS: List[str]
-SPEEDS_KMH: List[float]
-
-DV_MAX_KMH: float
-TOTAL_TIME: float
-ACCEL_LEVELS: List[float]
-DV_MAX_MPS: float
-BASE_A_MPS2: float
-ACCELS_MPS2: List[float]
-
-MIN_SPEED_KMH: float
-
 TRAJ_TYPES: List[str]
+NUM_TRAJ_PER_TYPE: Dict[str, int]
 
-# 转向相关（多角度、多起始点）
-TURN_TOTAL_DEG: float                      # 代表性角度（列表第一个）
-TURN_TOTAL_DEG_LIST: List[float]          # 多个备选总转向角（度）
-TURN_START_IDX: int                       # 代表性起始步（第一个系数推出来）
-TURN_START_COEFFS: List[float]            # 多个起始系数（0~1）
+# 车辆动力学上限
+SPEED_RANGE_KMH: Tuple[float, float]
+MIN_SPEED_KMH: float
+MAX_ACCEL_MPS2: float
+MAX_DECEL_MPS2: float
+MAX_YAW_RATE_DEG_S: float
 
-# S 弯左右段：既保留绝对索引，又支持系数区间对
-S_LEFT_START: int
-S_LEFT_END: int
-S_LEFT_COEFF_PAIRS: List[Tuple[float, float]]
+# 速度曲线采样
+SPEED_SEGMENTS_RANGE: Tuple[int, int]
+SPEED_JITTER_KMH: float
+ALLOW_STOP: bool
+STOP_PROB: float
 
-NUM_TRAJ_PER_COMBO: int
+# 各类 yaw-rate 采样参数（子 dict）
+STRAIGHT_CFG: Dict[str, Any]
+TURN_CFG: Dict[str, Any]
+S_CURVE_CFG: Dict[str, Any]
+U_TURN_CFG: Dict[str, Any]
 
+# 初始位姿
 INIT_X_RANGE: Tuple[float, float]
 INIT_Y_RANGE: Tuple[float, float]
 INIT_Z_RANGE: Tuple[float, float]
@@ -82,14 +68,29 @@ INIT_Z_RANGE: Tuple[float, float]
 USE_VERTICAL_MOTION: bool
 VERTICAL_VZ_RANGE_KMPS: Tuple[float, float]
 
-# domain randomization 噪声
-SPEED_NOISE_KMH: float          # 速度噪声幅度（km/h）
-ACCEL_NOISE_REL: float          # 加速度相对噪声比例（例如 0.3 表示 ±30%）
-
 RANDOM_SEED: int
 
 RAW_DIR: Path
-OUTPUT_CSV_NAME: str  # 只保存文件名，最终路径 = ROOT/RAW_DIR/OUTPUT_CSV_NAME
+OUTPUT_CSV_NAME: str
+
+
+# 旧版字段名（被弃用，若在 config 中出现会打 deprecation 警告）
+_DEPRECATED_KEYS = [
+    "speeds_kmh",
+    "motion_models",
+    "accel_levels",
+    "dv_max_kmh",
+    "turn_total_deg",
+    "turn_total_deg_list",
+    "turn_start_idx",
+    "turn_start_coeffs",
+    "s_left_start",
+    "s_left_end",
+    "s_left_coeff_pairs",
+    "num_traj_per_combo",
+    "speed_noise_kmh",
+    "accel_noise_rel",
+]
 
 
 # ======================= 从 config.yaml 读取并填充全局参数 ====================
@@ -99,281 +100,640 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def _as_int_range(value: Any, name: str, default: Tuple[int, int]) -> Tuple[int, int]:
+    if value is None:
+        return default
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"config.data.{name} 必须是长度为 2 的 [lo, hi] 列表")
+    lo, hi = int(value[0]), int(value[1])
+    if lo > hi:
+        raise ValueError(f"config.data.{name}: lo({lo}) > hi({hi})")
+    return lo, hi
+
+
+def _as_float_range(value: Any, name: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    if value is None:
+        return default
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"config.data.{name} 必须是长度为 2 的 [lo, hi] 列表")
+    lo, hi = float(value[0]), float(value[1])
+    if lo > hi:
+        raise ValueError(f"config.data.{name}: lo({lo}) > hi({hi})")
+    return lo, hi
+
+
 def apply_data_config(cfg: Dict[str, Any], project_root: Path) -> None:
-    """
-    读取 config['data']，填充本文件顶部所有全局变量。
-    如果某些字段没写，就使用与原脚本一致的默认值。
-    """
+    """读取 config['data'] 并填充本文件顶部所有全局变量。"""
     global TIME_STEP, NUM_STEPS
-    global MOTION_MODELS, SPEEDS_KMH
-    global DV_MAX_KMH, TOTAL_TIME, ACCEL_LEVELS, DV_MAX_MPS, BASE_A_MPS2, ACCELS_MPS2
-    global MIN_SPEED_KMH
-    global TRAJ_TYPES
-    global TURN_TOTAL_DEG, TURN_TOTAL_DEG_LIST, TURN_START_IDX, TURN_START_COEFFS
-    global S_LEFT_START, S_LEFT_END, S_LEFT_COEFF_PAIRS
-    global NUM_TRAJ_PER_COMBO
+    global TRAJ_TYPES, NUM_TRAJ_PER_TYPE
+    global SPEED_RANGE_KMH, MIN_SPEED_KMH
+    global MAX_ACCEL_MPS2, MAX_DECEL_MPS2, MAX_YAW_RATE_DEG_S
+    global SPEED_SEGMENTS_RANGE, SPEED_JITTER_KMH, ALLOW_STOP, STOP_PROB
+    global STRAIGHT_CFG, TURN_CFG, S_CURVE_CFG, U_TURN_CFG
     global INIT_X_RANGE, INIT_Y_RANGE, INIT_Z_RANGE
     global USE_VERTICAL_MOTION, VERTICAL_VZ_RANGE_KMPS
-    global SPEED_NOISE_KMH, ACCEL_NOISE_REL
     global RANDOM_SEED
     global RAW_DIR, OUTPUT_CSV_NAME
 
-    data_cfg = cfg.get("data", {})
+    data_cfg = cfg.get("data", {}) or {}
 
-    # 基本时间/步数
-    TIME_STEP = float(data_cfg.get("time_step", 60.0))      # 每步时间间隔（秒）
-    NUM_STEPS = int(data_cfg.get("num_steps", 100))         # 每条轨迹总步数
+    # --- deprecation 警告（不抛错，只是忽略） ---
+    legacy_used = [k for k in _DEPRECATED_KEYS if k in data_cfg]
+    if legacy_used:
+        warnings.warn(
+            "[generate_trajs] 以下 config.data 字段已弃用，新生成器不再读取："
+            f"{legacy_used}。你可以删掉它们；轨迹将由新的采样式流程生成。",
+            stacklevel=2,
+        )
 
-    # 模型 & 速度
-    MOTION_MODELS = list(data_cfg.get("motion_models", ["CV", "CA"]))
-    SPEEDS_KMH = [float(v) for v in data_cfg.get("speeds_kmh", [20.0, 30.0, 50.0])]
+    # --- 基本时间 / 步数 ---
+    TIME_STEP = float(data_cfg.get("time_step", 60.0))
+    NUM_STEPS = int(data_cfg.get("num_steps", 100))
+    if NUM_STEPS < 4:
+        raise ValueError("num_steps 必须 >= 4")
 
-    # “总时长内最多变化 DV_MAX_KMH” 的加速度逻辑
-    DV_MAX_KMH = float(data_cfg.get("dv_max_kmh", 20.0))
-    TOTAL_TIME = (NUM_STEPS - 1) * TIME_STEP
-
-    ACCEL_LEVELS = [float(a) for a in data_cfg.get("accel_levels", [-1.0, 0.0, 1.0])]
-    DV_MAX_MPS = DV_MAX_KMH * 1000.0 / 3600.0
-    BASE_A_MPS2 = DV_MAX_MPS / TOTAL_TIME
-    ACCELS_MPS2 = [alpha * BASE_A_MPS2 for alpha in ACCEL_LEVELS]
-
-    # 最小速度
-    MIN_SPEED_KMH = float(data_cfg.get("min_speed_kmh", 15.0))
-
-    # 轨迹类型
+    # --- 5 类标签与每类样本数 ---
     TRAJ_TYPES = list(
         data_cfg.get(
             "traj_types",
-            ["straight", "left_turn", "right_turn", "s_curve"],
+            ["straight", "left_turn", "right_turn", "s_curve", "u_turn"],
         )
     )
 
-    # 转弯总角度（列表）
-    turn_total_deg_list_cfg = data_cfg.get("turn_total_deg_list")
-    if turn_total_deg_list_cfg is None:
-        default_deg = float(data_cfg.get("turn_total_deg", 60.0))
-        TURN_TOTAL_DEG_LIST = [default_deg]
-    else:
-        TURN_TOTAL_DEG_LIST = [float(v) for v in turn_total_deg_list_cfg]
+    num_per_type_cfg = data_cfg.get("num_traj_per_type", {}) or {}
+    default_num = 200
+    NUM_TRAJ_PER_TYPE = {
+        t: int(num_per_type_cfg.get(t, default_num)) for t in TRAJ_TYPES
+    }
 
-    TURN_TOTAL_DEG = TURN_TOTAL_DEG_LIST[0]
+    # --- 动力学上限 ---
+    SPEED_RANGE_KMH = _as_float_range(
+        data_cfg.get("speed_range_kmh"), "speed_range_kmh", (15.0, 60.0)
+    )
+    MIN_SPEED_KMH = float(data_cfg.get("min_speed_kmh", 10.0))
+    if MIN_SPEED_KMH > SPEED_RANGE_KMH[0]:
+        # 允许 min_speed 低于 speed_range 的下界，但不允许高于下界
+        raise ValueError(
+            f"min_speed_kmh({MIN_SPEED_KMH}) 必须 <= speed_range_kmh[0]({SPEED_RANGE_KMH[0]})"
+        )
 
-    # 左/右转起始点系数
-    turn_start_coeffs_cfg = data_cfg.get("turn_start_coeffs")
-    if turn_start_coeffs_cfg is None:
-        default_idx = int(data_cfg.get("turn_start_idx", 50))
-        denom = max(1, NUM_STEPS - 1)
-        TURN_START_COEFFS = [default_idx / float(denom)]
-    else:
-        TURN_START_COEFFS = [float(c) for c in turn_start_coeffs_cfg]
+    MAX_ACCEL_MPS2 = float(data_cfg.get("max_accel_mps2", 0.8))
+    MAX_DECEL_MPS2 = float(data_cfg.get("max_decel_mps2", 1.5))
+    if MAX_ACCEL_MPS2 <= 0 or MAX_DECEL_MPS2 <= 0:
+        raise ValueError("max_accel_mps2 / max_decel_mps2 必须 > 0")
 
-    denom = max(1, NUM_STEPS - 1)
-    TURN_START_IDX = int(round(TURN_START_COEFFS[0] * denom))
+    MAX_YAW_RATE_DEG_S = float(data_cfg.get("max_yaw_rate_deg_s", 20.0))
+    if MAX_YAW_RATE_DEG_S <= 0:
+        raise ValueError("max_yaw_rate_deg_s 必须 > 0")
 
-    # 旧版 S 弯的绝对索引（用于默认或兜底）
-    S_LEFT_START = int(data_cfg.get("s_left_start", 33))
-    S_LEFT_END = int(data_cfg.get("s_left_end", 66))
+    # --- 速度曲线采样 ---
+    SPEED_SEGMENTS_RANGE = _as_int_range(
+        data_cfg.get("speed_segments_range"), "speed_segments_range", (1, 4)
+    )
+    if SPEED_SEGMENTS_RANGE[0] < 1:
+        raise ValueError("speed_segments_range 下界必须 >= 1")
 
-    # S 弯用的系数组对列表
-    s_pairs_cfg = data_cfg.get("s_left_coeff_pairs")
-    if s_pairs_cfg is None:
-        # 如果没给系数组对，就由绝对索引反推一个默认 pair
-        denom_s = max(1, NUM_STEPS - 1)
-        s_start_coeff = S_LEFT_START / float(denom_s)
-        s_end_coeff = S_LEFT_END / float(denom_s)
-        S_LEFT_COEFF_PAIRS = [(s_start_coeff, s_end_coeff)]
-    else:
-        pairs: List[Tuple[float, float]] = []
-        for pair in s_pairs_cfg:
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                continue
-            a, b = float(pair[0]), float(pair[1])
-            pairs.append((a, b))
-        if not pairs:
-            # 避免写错导致空列表，退回默认
-            denom_s = max(1, NUM_STEPS - 1)
-            s_start_coeff = S_LEFT_START / float(denom_s)
-            s_end_coeff = S_LEFT_END / float(denom_s)
-            S_LEFT_COEFF_PAIRS = [(s_start_coeff, s_end_coeff)]
+    SPEED_JITTER_KMH = float(data_cfg.get("speed_jitter_kmh", 2.0))
+    if SPEED_JITTER_KMH < 0:
+        raise ValueError("speed_jitter_kmh 必须 >= 0")
+
+    ALLOW_STOP = bool(data_cfg.get("allow_stop", False))
+    STOP_PROB = float(data_cfg.get("stop_prob", 0.0))
+    if not (0.0 <= STOP_PROB <= 1.0):
+        raise ValueError("stop_prob 必须在 [0, 1] 内")
+
+    # --- 每类 yaw-rate 参数 ---
+    STRAIGHT_CFG = dict(data_cfg.get("straight", {}) or {})
+    STRAIGHT_CFG.setdefault("heading_drift_deg_s", 0.2)
+
+    TURN_CFG = dict(data_cfg.get("turn", {}) or {})
+    TURN_CFG["n_turns_range"] = _as_int_range(
+        TURN_CFG.get("n_turns_range"), "turn.n_turns_range", (1, 3)
+    )
+    TURN_CFG["angle_range_deg"] = _as_float_range(
+        TURN_CFG.get("angle_range_deg"), "turn.angle_range_deg", (20.0, 120.0)
+    )
+    TURN_CFG["duration_range_steps"] = _as_int_range(
+        TURN_CFG.get("duration_range_steps"), "turn.duration_range_steps", (5, 40)
+    )
+    TURN_CFG["min_gap_steps"] = int(TURN_CFG.get("min_gap_steps", 3))
+
+    S_CURVE_CFG = dict(data_cfg.get("s_curve", {}) or {})
+    S_CURVE_CFG["n_segments_range"] = _as_int_range(
+        S_CURVE_CFG.get("n_segments_range"), "s_curve.n_segments_range", (2, 4)
+    )
+    if S_CURVE_CFG["n_segments_range"][0] < 2:
+        raise ValueError("s_curve.n_segments_range 下界必须 >= 2（S 型至少两段交替）")
+
+    S_CURVE_CFG["angle_range_deg"] = _as_float_range(
+        S_CURVE_CFG.get("angle_range_deg"), "s_curve.angle_range_deg", (20.0, 90.0)
+    )
+    S_CURVE_CFG["segment_len_range_steps"] = _as_int_range(
+        S_CURVE_CFG.get("segment_len_range_steps"),
+        "s_curve.segment_len_range_steps",
+        (8, 30),
+    )
+    S_CURVE_CFG["gap_steps_range"] = _as_int_range(
+        S_CURVE_CFG.get("gap_steps_range"), "s_curve.gap_steps_range", (0, 5)
+    )
+    S_CURVE_CFG["first_direction"] = str(
+        S_CURVE_CFG.get("first_direction", "random")
+    ).lower()
+    if S_CURVE_CFG["first_direction"] not in ("left", "right", "random"):
+        raise ValueError("s_curve.first_direction 只能是 left/right/random")
+
+    # --- u_turn（一次 ≈180° 的大转向，约束到能装进 in_len 或训练窗口） ---
+    U_TURN_CFG = dict(data_cfg.get("u_turn", {}) or {})
+    U_TURN_CFG["n_turns_range"] = _as_int_range(
+        U_TURN_CFG.get("n_turns_range"), "u_turn.n_turns_range", (1, 1)
+    )
+    U_TURN_CFG["angle_range_deg"] = _as_float_range(
+        U_TURN_CFG.get("angle_range_deg"), "u_turn.angle_range_deg", (150.0, 210.0)
+    )
+    U_TURN_CFG["duration_range_steps"] = _as_int_range(
+        U_TURN_CFG.get("duration_range_steps"),
+        "u_turn.duration_range_steps",
+        (6, 18),
+    )
+    U_TURN_CFG["min_gap_steps"] = int(U_TURN_CFG.get("min_gap_steps", 10))
+    U_TURN_CFG["direction"] = str(U_TURN_CFG.get("direction", "random")).lower()
+    if U_TURN_CFG["direction"] not in ("left", "right", "random"):
+        raise ValueError("u_turn.direction 只能是 left/right/random")
+
+    # --- 约束冲突早期校验：角度下界 vs yaw-rate 上限 ---
+    # 最短的 duration + 最大的 mag → 应不超过 max_yaw_rate
+    max_yaw_rate_rad_s = math.radians(MAX_YAW_RATE_DEG_S)
+    for cname, ccfg in (
+        ("turn", TURN_CFG),
+        ("s_curve", S_CURVE_CFG),
+        ("u_turn", U_TURN_CFG),
+    ):
+        if cname == "s_curve":
+            dur_lo, _ = ccfg["segment_len_range_steps"]
         else:
-            S_LEFT_COEFF_PAIRS = pairs
-            # 用第一个 pair 更新代表性索引（方便调试/打印）
-            denom_s = max(1, NUM_STEPS - 1)
-            S_LEFT_START = int(round(S_LEFT_COEFF_PAIRS[0][0] * denom_s))
-            S_LEFT_END = int(round(S_LEFT_COEFF_PAIRS[0][1] * denom_s))
+            dur_lo, _ = ccfg["duration_range_steps"]
+        ang_lo, ang_hi = ccfg["angle_range_deg"]
+        # 最极端：角度上界 + 持续步下界
+        required = math.radians(ang_hi) / (max(1, dur_lo) * TIME_STEP)
+        if required > max_yaw_rate_rad_s * 1.001:
+            raise ValueError(
+                f"[{cname}] angle_range_deg 上界 {ang_hi}° 在 {dur_lo} 步内完成"
+                f" 需要 {math.degrees(required):.2f} deg/s，超过 max_yaw_rate_deg_s="
+                f"{MAX_YAW_RATE_DEG_S}。请增大 duration 下界、降低 angle 上界或放宽 max_yaw_rate。"
+            )
+        # 同时用下界粗略估一下是否极度保守
+        _ = ang_lo  # 占位，避免 linter 提示未用
 
-    # 每个组合生成多少条轨迹
-    NUM_TRAJ_PER_COMBO = int(data_cfg.get("num_traj_per_combo", 50))
-
-    # 初始位置范围
+    # --- 初始位姿 ---
     INIT_X_RANGE = tuple(data_cfg.get("init_x_range", [-30.0, 30.0]))  # type: ignore
     INIT_Y_RANGE = tuple(data_cfg.get("init_y_range", [-30.0, 30.0]))  # type: ignore
     INIT_Z_RANGE = tuple(data_cfg.get("init_z_range", [0.0, 0.0]))     # type: ignore
 
-    # 垂直运动
+    # --- 垂直运动 ---
     USE_VERTICAL_MOTION = bool(data_cfg.get("use_vertical_motion", False))
     VERTICAL_VZ_RANGE_KMPS = tuple(
         data_cfg.get("vertical_vz_range_kmps", [-0.005, 0.005])
     )  # type: ignore
 
-    # domain randomization 噪声（不想用就设为 0）
-    SPEED_NOISE_KMH = float(data_cfg.get("speed_noise_kmh", 0.0))
-    ACCEL_NOISE_REL = float(data_cfg.get("accel_noise_rel", 0.0))
-
-    # 随机种子
+    # --- 随机种子 ---
     RANDOM_SEED = int(data_cfg.get("random_seed", 42))
 
-    # 输出路径
+    # --- 输出路径 ---
     raw_dir_str = data_cfg.get("raw_dir", "data/raw")
     RAW_DIR = (project_root / raw_dir_str).resolve()
-
     OUTPUT_CSV_NAME = data_cfg.get("output_csv", "synthetic_trajectories.csv")
 
 
-# ======================= 轨迹生成逻辑 ====================
+# ======================= 采样器 =========================
 
-def heading_schedule(
-    traj_type: str,
-    step_idx: int,
+def sample_speed_profile_kmh(
     num_steps: int,
-    base_heading_rad: float,
-    turn_total_deg: float,
-    turn_start_idx: int,
-    s_left_start: int,
-    s_left_end: int,
-) -> float:
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, int, bool]:
     """
-    给定轨迹类型 + 步索引，返回当前步的航向角（弧度）。
+    返回 (profile, n_segments, has_stop)：
+      - profile [T]: 速度曲线（km/h）
+      - n_segments: 本条轨迹分了几段
+      - has_stop: 是否命中了 allow_stop 的停车段
 
-    设计：
-      - straight: 一直是 base_heading
-      - left_turn/right_turn:
-          前 turn_start_idx 步保持 base_heading，
-          后面步数线性从 base_heading 过渡到 base_heading ± turn_total_deg
-      - s_curve:
-          [0, s_left_start]      ：base_heading
-          [s_left_start, s_left_end] 左转到 base_heading + θ
-          [s_left_end, N-1]      ：再右转回 base_heading
+    生成规则：
+      - 分 K 段（K ∈ SPEED_SEGMENTS_RANGE），每段一个目标速度（均匀采自 SPEED_RANGE_KMH）；
+      - 段间做受加速度约束的线性过渡；
+      - 叠加小幅抖动；
+      - 裁剪到 [max(MIN_SPEED_KMH, 0), SPEED_RANGE_KMH[1]]；
+      - 如 ALLOW_STOP，以 STOP_PROB 概率在某一段强制为 0。
     """
-    theta = math.radians(turn_total_deg)
-    N = num_steps
-    i = step_idx
+    T = num_steps
+    lo_seg, hi_seg = SPEED_SEGMENTS_RANGE
+    K = int(rng.integers(lo_seg, hi_seg + 1))
+    K = max(1, K)
 
+    v_lo, v_hi = SPEED_RANGE_KMH
+
+    # 段边界：第 0 段从 step 0 开始，最后一段到 step T-1 结束
+    # 选 K-1 个内部切点（单调递增、严格在 (0, T-1) 区间）
+    if K == 1:
+        seg_starts = [0]
+    else:
+        cut_candidates = np.arange(1, T - 1)
+        if len(cut_candidates) < K - 1:
+            K = max(1, len(cut_candidates) + 1)
+        cuts = (
+            np.sort(rng.choice(cut_candidates, size=K - 1, replace=False))
+            if K > 1
+            else np.array([], dtype=int)
+        )
+        seg_starts = [0] + cuts.tolist()
+    seg_ends = seg_starts[1:] + [T]  # 段 i 覆盖 [seg_starts[i], seg_ends[i])
+
+    # 每段目标速度
+    targets = rng.uniform(v_lo, v_hi, size=K)
+
+    # 可选：强制某一段为 0（停车）
+    has_stop = False
+    if ALLOW_STOP and rng.random() < STOP_PROB and K >= 1:
+        stop_seg_idx = int(rng.integers(0, K))
+        targets[stop_seg_idx] = 0.0
+        has_stop = True
+
+    # 拼段：每段内先按"目标速度"填，但用受加速度约束的线性过渡
+    profile = np.empty(T, dtype=np.float64)
+    # 初始速度：第一段的目标速度作为起点
+    v = float(targets[0])
+    max_dv_per_step_kmh = max(MAX_ACCEL_MPS2, MAX_DECEL_MPS2) * 3.6 * TIME_STEP  # m/s^2 -> km/h per step
+    for k in range(K):
+        s, e = seg_starts[k], seg_ends[k]
+        tgt = float(targets[k])
+        for i in range(s, e):
+            # 向 tgt 线性过渡，但单步变化不超过 max_dv_per_step_kmh
+            dv = tgt - v
+            if dv > max_dv_per_step_kmh:
+                v = v + max_dv_per_step_kmh
+            elif dv < -max_dv_per_step_kmh:
+                v = v - max_dv_per_step_kmh
+            else:
+                v = tgt
+            profile[i] = v
+
+    # 步间抖动
+    if SPEED_JITTER_KMH > 0:
+        profile = profile + rng.normal(0.0, SPEED_JITTER_KMH, size=T)
+
+    # 裁剪
+    v_floor = max(MIN_SPEED_KMH, 0.0)
+    profile = np.clip(profile, v_floor, v_hi)
+
+    # 若命中了 stop 段，让该段真的为 0（绕开 MIN_SPEED 的 floor）
+    if ALLOW_STOP:
+        for k in range(K):
+            if targets[k] == 0.0:
+                s, e = seg_starts[k], seg_ends[k]
+                profile[s:e] = 0.0
+
+    return profile, int(K), bool(has_stop)
+
+
+def _sample_nonoverlap_segments(
+    num_steps: int,
+    n_segments: int,
+    duration_range: Tuple[int, int],
+    min_gap_steps: int,
+    rng: np.random.Generator,
+    max_attempts: int = 50,
+) -> List[Tuple[int, int]]:
+    """
+    在 [0, num_steps) 里采 n_segments 个不重叠区间 [start, start+dur)，
+    段间至少留 min_gap_steps 空隙，段首/末与 0 / num_steps 也保留 min_gap_steps。
+
+    返回按起点升序的 [(start, duration), ...]。
+
+    采样策略：
+      - 先尝试"等分 + 抖动"：把 num_steps 均分 n 份，每份内放一段；
+      - 若 max_attempts 次都放不下，则缩小 duration 上界重试；
+      - 再失败则降低 n_segments。
+    """
+    dur_lo, dur_hi = duration_range
+    n = max(1, n_segments)
+
+    def _try(n_try: int, dur_hi_try: int) -> Optional[List[Tuple[int, int]]]:
+        # 估计总占用步数是否放得下
+        #   需要：n * dur_lo + (n + 1) * min_gap_steps <= num_steps
+        if n_try * dur_lo + (n_try + 1) * min_gap_steps > num_steps:
+            return None
+
+        for _ in range(max_attempts):
+            # 把 num_steps 均分 n_try 份，每份内采一个段
+            slot_len = num_steps // n_try
+            if slot_len <= dur_lo + 2 * min_gap_steps:
+                # 每槽太小，降低 dur_hi 再试
+                return None
+            segs: List[Tuple[int, int]] = []
+            ok = True
+            for k in range(n_try):
+                slot_start = k * slot_len
+                slot_end = (k + 1) * slot_len if k < n_try - 1 else num_steps
+                dur = int(rng.integers(dur_lo, min(dur_hi_try, slot_end - slot_start - 2 * min_gap_steps) + 1))
+                if dur < dur_lo:
+                    ok = False
+                    break
+                latest_start = slot_end - dur - min_gap_steps
+                earliest_start = slot_start + min_gap_steps
+                if latest_start < earliest_start:
+                    ok = False
+                    break
+                start = int(rng.integers(earliest_start, latest_start + 1))
+                segs.append((start, dur))
+            if ok:
+                return segs
+        return None
+
+    # 尝试：原参数 → 缩小 dur_hi → 减少段数
+    cur_dur_hi = dur_hi
+    cur_n = n
+    while cur_n >= 1:
+        while cur_dur_hi >= dur_lo:
+            res = _try(cur_n, cur_dur_hi)
+            if res is not None:
+                return res
+            cur_dur_hi = max(dur_lo, cur_dur_hi - 1)
+            if cur_dur_hi == dur_lo:
+                res = _try(cur_n, cur_dur_hi)
+                if res is not None:
+                    return res
+                break
+        cur_n -= 1
+        cur_dur_hi = dur_hi  # 下一轮重置
+
+    # 兜底：至少返回一段，起点 min_gap_steps，持续 dur_lo
+    dur = min(dur_lo, max(1, num_steps - 2 * min_gap_steps))
+    return [(max(0, min_gap_steps), max(1, dur))]
+
+
+def _build_yaw_rate_from_segments(
+    num_steps: int,
+    segments: List[Tuple[int, int, float]],
+    rng: np.random.Generator,
+    drift_deg_s: float = 0.0,
+) -> np.ndarray:
+    """
+    segments: [(start, duration, angle_rad), ...]，每段内用常数 yaw_rate
+              = angle_rad / (duration * TIME_STEP)。
+    空隙处 yaw_rate = 0，叠加极小的 gaussian drift（drift_deg_s）。
+    """
+    T = num_steps
+    yaw = np.zeros(T, dtype=np.float64)
+
+    # 段内常数 yaw rate
+    max_yaw_rate_rad_s = math.radians(MAX_YAW_RATE_DEG_S)
+    for start, dur, ang in segments:
+        if dur <= 0:
+            continue
+        rate = ang / (dur * TIME_STEP)
+        # 裁剪到 yaw rate 上限（理论上 apply_data_config 保证不会超）
+        if rate > max_yaw_rate_rad_s:
+            rate = max_yaw_rate_rad_s
+        elif rate < -max_yaw_rate_rad_s:
+            rate = -max_yaw_rate_rad_s
+        end = min(T, start + dur)
+        yaw[start:end] = rate
+
+    # 非常小的漂移（车道内的方向抖动感）
+    if drift_deg_s > 0:
+        yaw = yaw + rng.normal(0.0, math.radians(drift_deg_s), size=T)
+        yaw = np.clip(yaw, -max_yaw_rate_rad_s, max_yaw_rate_rad_s)
+
+    return yaw
+
+
+def sample_yaw_rate_profile_rad_s(
+    traj_type: str,
+    num_steps: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """按 traj_type 采样一条长度 num_steps 的 yaw-rate 曲线（rad/s）。"""
     if traj_type == "straight":
-        return base_heading_rad
+        # 仅极小漂移
+        drift = float(STRAIGHT_CFG.get("heading_drift_deg_s", 0.2))
+        return _build_yaw_rate_from_segments(
+            num_steps=num_steps,
+            segments=[],
+            rng=rng,
+            drift_deg_s=drift,
+        )
 
     if traj_type in ("left_turn", "right_turn"):
-        if i <= turn_start_idx:
-            frac = 0.0
-        else:
-            # 从 turn_start_idx -> N-1 线性过渡到 1.0
-            denom = max(1, (N - 1 - turn_start_idx))
-            frac = (i - turn_start_idx) / denom
-            frac = max(0.0, min(1.0, frac))
+        sign = +1.0 if traj_type == "left_turn" else -1.0
+        n_lo, n_hi = TURN_CFG["n_turns_range"]
+        a_lo, a_hi = TURN_CFG["angle_range_deg"]
+        d_range = TURN_CFG["duration_range_steps"]
+        gap = int(TURN_CFG["min_gap_steps"])
 
-        signed_theta = theta if traj_type == "left_turn" else -theta
-        return base_heading_rad + signed_theta * frac
+        n_turns = int(rng.integers(n_lo, n_hi + 1))
+        segs_raw = _sample_nonoverlap_segments(
+            num_steps=num_steps,
+            n_segments=n_turns,
+            duration_range=d_range,
+            min_gap_steps=gap,
+            rng=rng,
+        )
+        segments: List[Tuple[int, int, float]] = []
+        for start, dur in segs_raw:
+            mag_deg = float(rng.uniform(a_lo, a_hi))
+            segments.append((start, dur, sign * math.radians(mag_deg)))
+        # 直线段也加一点极小 drift，让非转向段不是完美的 0
+        drift = float(TURN_CFG.get("straight_drift_deg_s", 0.0))
+        return _build_yaw_rate_from_segments(
+            num_steps=num_steps,
+            segments=segments,
+            rng=rng,
+            drift_deg_s=drift,
+        )
 
     if traj_type == "s_curve":
-        # S: 左转到 +θ，再右转回 base_heading
-        if i <= s_left_start:
-            return base_heading_rad
+        n_lo, n_hi = S_CURVE_CFG["n_segments_range"]
+        a_lo, a_hi = S_CURVE_CFG["angle_range_deg"]
+        seg_range = S_CURVE_CFG["segment_len_range_steps"]
+        gap_lo, gap_hi = S_CURVE_CFG["gap_steps_range"]
+        first_dir = S_CURVE_CFG["first_direction"]
 
-        if s_left_start < i <= s_left_end:
-            # 左转段：从 0 -> +θ
-            denom = max(1, (s_left_end - s_left_start))
-            frac = (i - s_left_start) / denom
-            frac = max(0.0, min(1.0, frac))
-            return base_heading_rad + theta * frac
+        n_segs = int(rng.integers(n_lo, n_hi + 1))
+        # 用 _sample_nonoverlap_segments 放置位置，但它要的是统一 min_gap；
+        # 这里用 gap 随机下界作为 min_gap，后续再对段顺序做"交替"处理。
+        min_gap = int(gap_lo)
+        segs_raw = _sample_nonoverlap_segments(
+            num_steps=num_steps,
+            n_segments=n_segs,
+            duration_range=seg_range,
+            min_gap_steps=max(0, min_gap),
+            rng=rng,
+        )
+        # 按 start 升序已有；构造交替符号
+        if first_dir == "random":
+            sign = +1.0 if rng.random() < 0.5 else -1.0
+        elif first_dir == "left":
+            sign = +1.0
+        else:
+            sign = -1.0
 
-        # 右转段：从 +θ -> 0
-        denom = max(1, (N - 1 - s_left_end))
-        frac = (i - s_left_end) / denom
-        frac = max(0.0, min(1.0, frac))
-        return base_heading_rad + theta * (1.0 - frac)
+        # gap 也可以再随机些，但段间已经满足 min_gap，这里只影响语义
+        _ = gap_hi
 
-    # 未知类型就当直线处理
-    return base_heading_rad
+        segments = []
+        for i, (start, dur) in enumerate(segs_raw):
+            s = sign if (i % 2 == 0) else -sign
+            mag_deg = float(rng.uniform(a_lo, a_hi))
+            segments.append((start, dur, s * math.radians(mag_deg)))
+        drift = float(S_CURVE_CFG.get("drift_deg_s", 0.0))
+        return _build_yaw_rate_from_segments(
+            num_steps=num_steps,
+            segments=segments,
+            rng=rng,
+            drift_deg_s=drift,
+        )
+
+    if traj_type == "u_turn":
+        # 一次 ~180° 的大转向；duration 控制在能装进训练窗口 (in_len) 内。
+        n_lo, n_hi = U_TURN_CFG["n_turns_range"]
+        a_lo, a_hi = U_TURN_CFG["angle_range_deg"]
+        d_range = U_TURN_CFG["duration_range_steps"]
+        gap = int(U_TURN_CFG["min_gap_steps"])
+        direction = U_TURN_CFG["direction"]
+
+        n_turns = int(rng.integers(n_lo, n_hi + 1))
+        segs_raw = _sample_nonoverlap_segments(
+            num_steps=num_steps,
+            n_segments=n_turns,
+            duration_range=d_range,
+            min_gap_steps=gap,
+            rng=rng,
+        )
+
+        # 方向决定：整条轨迹里每一次掉头都用同一个方向，避免和 s_curve 混淆。
+        # （n_turns_range 默认 [1,1]，所以这里基本上就是单次的方向。）
+        if direction == "random":
+            sign = +1.0 if rng.random() < 0.5 else -1.0
+        elif direction == "left":
+            sign = +1.0
+        else:
+            sign = -1.0
+
+        segments = []
+        for start, dur in segs_raw:
+            mag_deg = float(rng.uniform(a_lo, a_hi))
+            segments.append((start, dur, sign * math.radians(mag_deg)))
+        drift = float(U_TURN_CFG.get("straight_drift_deg_s", 0.0))
+        return _build_yaw_rate_from_segments(
+            num_steps=num_steps,
+            segments=segments,
+            rng=rng,
+            drift_deg_s=drift,
+        )
+
+    # 未知类别：当作直线
+    return _build_yaw_rate_from_segments(
+        num_steps=num_steps,
+        segments=[],
+        rng=rng,
+        drift_deg_s=0.0,
+    )
 
 
-def simulate_trajectory(
-    motion_model: str,
-    base_speed_kmh: float,
-    accel_mps2: float,
-    traj_type: str,
-    init_x_km: float,
-    init_y_km: float,
-    init_z_km: float,
-    init_heading_rad: float,
-    turn_total_deg: float,
-    turn_start_idx: int,
-    s_left_start: int,
-    s_left_end: int,
+# ======================= 积分器 =========================
+
+def integrate_trajectory(
+    x0_km: float,
+    y0_km: float,
+    z0_km: float,
+    heading0_rad: float,
+    speed_profile_kmh: np.ndarray,
+    yaw_rate_rad_s: np.ndarray,
+    dt_s: float,
+    use_vertical: bool,
+    vz_range_kmps: Tuple[float, float],
+    rng: np.random.Generator,
 ) -> List[Tuple[float, float, float, float, float, float]]:
+    """前向欧拉积分，输出与旧版 simulate_trajectory 同构：
+       [(x, y, z, vx, vy, vz), ...]，长度 = len(speed_profile_kmh)
+       单位：位置 km，速度 km/s
     """
-    生成一条轨迹：
-      [(x_km, y_km, z_km, vx_kmps, vy_kmps, vz_kmps), ...] 长度 NUM_STEPS
-    """
+    T = len(speed_profile_kmh)
+    assert len(yaw_rate_rad_s) == T
 
-    # 速度 & 加速度单位转换
-    v_kmps = base_speed_kmh / 3600.0       # km/h → km/s
-    a_kmps2 = accel_mps2 / 1000.0          # m/s^2 → km/s^2
-    min_speed_kmps = MIN_SPEED_KMH / 3600.0
-
-    # 初始状态
-    x = init_x_km
-    y = init_y_km
-    z = init_z_km
-
-    if USE_VERTICAL_MOTION:
-        vz = random.uniform(*VERTICAL_VZ_RANGE_KMPS)
+    if use_vertical:
+        vz = float(rng.uniform(vz_range_kmps[0], vz_range_kmps[1]))
     else:
         vz = 0.0
 
     states: List[Tuple[float, float, float, float, float, float]] = []
+    x, y, z = float(x0_km), float(y0_km), float(z0_km)
+    heading = float(heading0_rad)
 
-    for step in range(NUM_STEPS):
-        heading = heading_schedule(
-            traj_type=traj_type,
-            step_idx=step,
-            num_steps=NUM_STEPS,
-            base_heading_rad=init_heading_rad,
-            turn_total_deg=turn_total_deg,
-            turn_start_idx=turn_start_idx,
-            s_left_start=s_left_start,
-            s_left_end=s_left_end,
-        )
-
+    for t in range(T):
+        v_kmps = float(speed_profile_kmh[t]) / 3600.0
         vx = v_kmps * math.cos(heading)
         vy = v_kmps * math.sin(heading)
-
         states.append((x, y, z, vx, vy, vz))
 
-        x += vx * TIME_STEP
-        y += vy * TIME_STEP
-        z += vz * TIME_STEP
+        # 积分位置
+        x += vx * dt_s
+        y += vy * dt_s
+        z += vz * dt_s
 
-        if motion_model == "CA":
-            v_kmps += a_kmps2 * TIME_STEP
-            if v_kmps < min_speed_kmps:
-                v_kmps = min_speed_kmps
+        # 更新 heading（用本步的 yaw_rate）
+        heading = heading + float(yaw_rate_rad_s[t]) * dt_s
 
     return states
 
 
-# ======================= 主函数 ====================
+# ======================= 轨迹统计（回填 CSV 兼容列） =========================
+
+def _infer_compat_cols(
+    speed_profile_kmh: np.ndarray,
+    n_segments: int,
+    has_stop: bool,
+) -> Tuple[str, float, float]:
+    """为 CSV 中的 motion_model / base_speed_kmh / accel_mps2 列回填
+    一个"事后统计"的值，仅为兼容，不影响下游 dataset。
+
+    语义约定（与速度曲线采样器一致）：
+      - 若本条轨迹只有 1 段速度目标（n_segments == 1）且没有触发 stop，
+        虽然有 speed_jitter 抖动，但整体是"围绕同一个目标速度"，记作 CV；
+      - 否则（多段 / 停车段）记作 CA。
+    """
+    T = len(speed_profile_kmh)
+    if T == 0:
+        return "CV", 0.0, 0.0
+
+    mean_v = float(np.mean(speed_profile_kmh))
+    if T >= 2:
+        dv_kmh = np.diff(speed_profile_kmh)
+        dv_mps2 = dv_kmh * (1000.0 / 3600.0) / max(TIME_STEP, 1e-6)
+        mean_abs_a = float(np.mean(np.abs(dv_mps2)))
+    else:
+        mean_abs_a = 0.0
+
+    motion_model = "CV" if (n_segments <= 1 and not has_stop) else "CA"
+    return motion_model, mean_v, mean_abs_a
+
+
+# ======================= 主函数 =========================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate synthetic trajectories.")
+    parser = argparse.ArgumentParser(description="Generate synthetic vehicle trajectories (sampled).")
     parser.add_argument(
         "--config",
         type=str,
         default="config.yaml",
-        help="Path to config.yaml (relative to project root or absolute).",
+        help="config.yaml 路径（相对 new_plan/lstm1/ 或绝对路径）。",
+    )
+    parser.add_argument(
+        "--num-per-type",
+        type=int,
+        default=None,
+        help="可选：覆盖 config.data.num_traj_per_type 中所有类的值，便于小量预生成。",
     )
     args = parser.parse_args()
 
-    # 计算项目根目录（…/project_root/code/data/generate_trajs.py → project_root）
     project_root = Path(__file__).resolve().parents[2]
 
     config_path = Path(args.config)
@@ -383,14 +743,20 @@ def main() -> None:
     cfg = load_config(config_path)
     apply_data_config(cfg, project_root)
 
-    random.seed(RANDOM_SEED)
+    if args.num_per_type is not None:
+        n_override = int(args.num_per_type)
+        for k in NUM_TRAJ_PER_TYPE:
+            NUM_TRAJ_PER_TYPE[k] = n_override
+
+    # 随机源（Python random + numpy Generator 同种子）
+    rng_py = random.Random(RANDOM_SEED)
+    rng_np = np.random.default_rng(RANDOM_SEED)
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RAW_DIR / OUTPUT_CSV_NAME
 
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
-
         writer.writerow(
             [
                 "traj_id",
@@ -412,134 +778,75 @@ def main() -> None:
         traj_id = 0
         num_rows = 0
 
-        denom_turn = max(1, NUM_STEPS - 1)
-        denom_s = max(1, NUM_STEPS - 1)
+        per_type_counts: Dict[str, int] = {t: 0 for t in TRAJ_TYPES}
 
-        for motion_model in MOTION_MODELS:
-            for speed_kmh in SPEEDS_KMH:
+        for traj_type in TRAJ_TYPES:
+            n = int(NUM_TRAJ_PER_TYPE.get(traj_type, 0))
+            for _ in range(n):
+                traj_id += 1
 
-                # CV 下加速度强制为 0
-                if motion_model == "CV":
-                    accel_list = [0.0]
-                else:
-                    accel_list = ACCELS_MPS2
+                # --- 1) 初始位姿 ---
+                x0 = rng_py.uniform(*INIT_X_RANGE)
+                y0 = rng_py.uniform(*INIT_Y_RANGE)
+                z0 = rng_py.uniform(*INIT_Z_RANGE)
+                heading0 = rng_py.uniform(0.0, 2.0 * math.pi)
 
-                for accel_mps2 in accel_list:
-                    for traj_type in TRAJ_TYPES:
+                # --- 2) 速度曲线 ---
+                speed_profile, n_speed_segments, has_stop = sample_speed_profile_kmh(
+                    NUM_STEPS, rng_np
+                )
 
-                        # 直线 / 左转 / 右转：用所有角度和起始系数组合
-                        # S 弯：额外乘以 s_left_coeff_pairs
-                        angle_list = TURN_TOTAL_DEG_LIST
-                        start_coeff_list = TURN_START_COEFFS
+                # --- 3) yaw-rate 曲线 ---
+                yaw_rate = sample_yaw_rate_profile_rad_s(
+                    traj_type, NUM_STEPS, rng_np
+                )
 
-                        if traj_type == "s_curve":
-                            s_pair_list: List[Optional[Tuple[float, float]]] = S_LEFT_COEFF_PAIRS
-                        else:
-                            # 非 S 弯只用一个代表性 S 段区间
-                            s_pair_list = [None]
+                # --- 4) 积分 ---
+                states = integrate_trajectory(
+                    x0_km=x0,
+                    y0_km=y0,
+                    z0_km=z0,
+                    heading0_rad=heading0,
+                    speed_profile_kmh=speed_profile,
+                    yaw_rate_rad_s=yaw_rate,
+                    dt_s=TIME_STEP,
+                    use_vertical=USE_VERTICAL_MOTION,
+                    vz_range_kmps=VERTICAL_VZ_RANGE_KMPS,
+                    rng=rng_np,
+                )
 
-                        for turn_total_deg in angle_list:
-                            for start_coeff in start_coeff_list:
-                                # 左/右转起始步索引
-                                raw_idx = int(round(start_coeff * denom_turn))
-                                turn_start_idx = max(0, min(NUM_STEPS - 2, raw_idx))
+                # --- 5) 回填兼容列 ---
+                motion_model, base_speed_kmh, accel_mps2 = _infer_compat_cols(
+                    speed_profile, n_speed_segments, has_stop
+                )
 
-                                for s_pair in s_pair_list:
-                                    # 计算 S 段左右索引
-                                    if traj_type == "s_curve":
-                                        if s_pair is None:
-                                            s_left_start = S_LEFT_START
-                                            s_left_end = S_LEFT_END
-                                        else:
-                                            s_start_c, s_end_c = s_pair
-                                            s_left_start = int(round(s_start_c * denom_s))
-                                            s_left_end = int(round(s_end_c * denom_s))
-                                            # 夹在合法范围内
-                                            s_left_start = max(0, min(NUM_STEPS - 2, s_left_start))
-                                            s_left_end = max(1, min(NUM_STEPS - 1, s_left_end))
-                                            if s_left_start >= s_left_end:
-                                                # 强制至少有一段：如果写反或重合就调一下
-                                                s_left_start = max(0, min(NUM_STEPS - 2, s_left_start))
-                                                s_left_end = min(NUM_STEPS - 1, s_left_start + 1)
-                                    else:
-                                        # 非 S 弯时 S 段只作为占位参数
-                                        s_left_start = S_LEFT_START
-                                        s_left_end = S_LEFT_END
+                for step_idx, (x, y, z, vx, vy, vz) in enumerate(states):
+                    time_s = step_idx * TIME_STEP
+                    writer.writerow(
+                        [
+                            traj_id,
+                            motion_model,
+                            base_speed_kmh,
+                            accel_mps2,
+                            traj_type,
+                            step_idx,
+                            time_s,
+                            x,
+                            y,
+                            z,
+                            vx,
+                            vy,
+                            vz,
+                        ]
+                    )
+                    num_rows += 1
 
-                                    for _ in range(NUM_TRAJ_PER_COMBO):
-                                        traj_id += 1
-
-                                        # ---------- 1) 对速度 / 加速度做 domain randomization ----------
-                                        # speed_sample 以 combo 的 speed_kmh 为中心，加一点噪声
-                                        if SPEED_NOISE_KMH > 0.0:
-                                            speed_sample = speed_kmh + random.uniform(
-                                                -SPEED_NOISE_KMH, SPEED_NOISE_KMH
-                                            )
-                                        else:
-                                            speed_sample = speed_kmh
-
-                                        # 限制最小速度
-                                        if speed_sample < MIN_SPEED_KMH:
-                                            speed_sample = MIN_SPEED_KMH
-
-                                        # CA 模型下的加速度也加一点相对噪声；CV 保持 0
-                                        if motion_model == "CA":
-                                            if ACCEL_NOISE_REL > 0.0 and accel_mps2 != 0.0:
-                                                factor = 1.0 + random.uniform(
-                                                    -ACCEL_NOISE_REL, ACCEL_NOISE_REL
-                                                )
-                                                accel_sample = accel_mps2 * factor
-                                            else:
-                                                accel_sample = accel_mps2
-                                        else:
-                                            accel_sample = 0.0
-
-                                        # ---------- 2) 初始位置 / 方向随机 ----------
-                                        init_x = random.uniform(*INIT_X_RANGE)
-                                        init_y = random.uniform(*INIT_Y_RANGE)
-                                        init_z = random.uniform(*INIT_Z_RANGE)
-                                        init_heading = random.uniform(0.0, 2.0 * math.pi)
-
-                                        # ---------- 3) 用“带噪声”的参数生成这条轨迹 ----------
-                                        states = simulate_trajectory(
-                                            motion_model=motion_model,
-                                            base_speed_kmh=speed_sample,
-                                            accel_mps2=accel_sample,
-                                            traj_type=traj_type,
-                                            init_x_km=init_x,
-                                            init_y_km=init_y,
-                                            init_z_km=init_z,
-                                            init_heading_rad=init_heading,
-                                            turn_total_deg=turn_total_deg,
-                                            turn_start_idx=turn_start_idx,
-                                            s_left_start=s_left_start,
-                                            s_left_end=s_left_end,
-                                        )
-
-                                        # ---------- 4) 写出：记录实际使用的 speed/accel ----------
-                                        for step_idx, (x, y, z, vx, vy, vz) in enumerate(states):
-                                            time_s = step_idx * TIME_STEP
-                                            writer.writerow(
-                                                [
-                                                    traj_id,
-                                                    motion_model,
-                                                    speed_sample,
-                                                    accel_sample,
-                                                    traj_type,
-                                                    step_idx,
-                                                    time_s,
-                                                    x,
-                                                    y,
-                                                    z,
-                                                    vx,
-                                                    vy,
-                                                    vz,
-                                                ]
-                                            )
-                                            num_rows += 1
+                per_type_counts[traj_type] += 1
 
     print(
-        f"生成完成：{traj_id} 条轨迹，总 {num_rows} 行，输出到 {out_path}"
+        f"[generate_trajs] 生成完成：{traj_id} 条轨迹，总 {num_rows} 行。\n"
+        f"  每类数量：{per_type_counts}\n"
+        f"  输出：{out_path}"
     )
 
 

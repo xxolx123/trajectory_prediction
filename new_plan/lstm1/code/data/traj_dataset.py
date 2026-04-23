@@ -37,6 +37,8 @@ data:
 
 """
 
+import random
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -168,6 +170,108 @@ def load_raw_trajectories(cfg: Dict[str, Any], project_root: Path) -> pd.DataFra
     return df
 
 
+# ===================== 按轨迹元数据做分层划分 =====================
+
+
+def _build_traj_meta(df: pd.DataFrame) -> Dict[int, Tuple[str, str]]:
+    """
+    为每条 traj_id 取一个 (motion_model, traj_type) 作为分层键。
+
+    如果 CSV 里没有这两列，就退化成单一分层键（"_ALL_", "_ALL_"），
+    此时 _stratified_split_ids 会退化为简单的随机划分。
+    """
+    has_motion = "motion_model" in df.columns
+    has_type = "traj_type" in df.columns
+
+    if not has_motion and not has_type:
+        return {int(tid): ("_ALL_", "_ALL_") for tid in df["traj_id"].unique()}
+
+    cols = ["traj_id"]
+    if has_motion:
+        cols.append("motion_model")
+    if has_type:
+        cols.append("traj_type")
+
+    meta_df = df[cols].drop_duplicates(subset=["traj_id"])
+    meta: Dict[int, Tuple[str, str]] = {}
+    for _, row in meta_df.iterrows():
+        tid = int(row["traj_id"])
+        motion = str(row["motion_model"]) if has_motion else "_ALL_"
+        ttype = str(row["traj_type"]) if has_type else "_ALL_"
+        meta[tid] = (motion, ttype)
+    return meta
+
+
+def _stratified_split_ids(
+    traj_ids: List[int],
+    meta: Dict[int, Tuple[str, str]],
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    按 (motion_model, traj_type) 分层切 train/val/test。
+
+    规则：
+      - 在每个 stratum 内，用固定 seed 做 shuffle
+      - 每个 stratum 内按比例切分：
+          n_train_s = floor(ratio_train * n_s)
+          n_val_s   = floor(ratio_val   * n_s)
+          剩下的归到 test
+      - 如果某个 stratum 样本数不足 3（比如只有 1 条），
+        会优先保证 train 至少 1 条，其次 val 1 条，再其次 test 1 条。
+
+    返回全局 shuffled 过的 train_ids / val_ids / test_ids。
+    """
+    assert 0.0 < train_ratio < 1.0
+    assert 0.0 <= val_ratio < 1.0
+    assert 0.0 <= test_ratio < 1.0
+
+    rng = random.Random(seed)
+
+    buckets: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    for tid in traj_ids:
+        buckets[meta.get(tid, ("_ALL_", "_ALL_"))].append(tid)
+
+    train_ids: List[int] = []
+    val_ids: List[int] = []
+    test_ids: List[int] = []
+
+    for key in sorted(buckets.keys()):
+        ids = buckets[key][:]
+        rng.shuffle(ids)
+        n_s = len(ids)
+
+        if n_s == 0:
+            continue
+        if n_s == 1:
+            train_ids.extend(ids)
+            continue
+        if n_s == 2:
+            train_ids.append(ids[0])
+            val_ids.append(ids[1])
+            continue
+
+        n_train_s = int(n_s * train_ratio)
+        n_val_s = int(n_s * val_ratio)
+        n_train_s = max(1, n_train_s)
+        n_val_s = max(1, n_val_s)
+        if n_train_s + n_val_s >= n_s:
+            n_train_s = max(1, n_s - 2)
+            n_val_s = 1
+
+        train_ids.extend(ids[:n_train_s])
+        val_ids.extend(ids[n_train_s : n_train_s + n_val_s])
+        test_ids.extend(ids[n_train_s + n_val_s :])
+
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+    rng.shuffle(test_ids)
+
+    return train_ids, val_ids, test_ids
+
+
 # ===================== 核心：构造滑动窗口 =====================
 
 
@@ -294,24 +398,34 @@ def build_datasets_from_config(
     df = load_raw_trajectories(cfg, project_root)
 
     # 2) 根据 traj_id 划分 train/val/test
-    traj_ids = sorted(df["traj_id"].unique().tolist())
+    #    关键修复：原来是 sorted(unique) 后顺序切片，而 generate_trajs.py
+    #    里 traj_id 是按 (motion_model × speed × accel × traj_type × ...)
+    #    嵌套循环顺序递增的，直接切片会让 train/val/test 分布严重不一致
+    #    （例如 train 里全是 CV+直线，test 里全是 CA+S 弯）。
+    #    这里改为按 (motion_model, traj_type) 分层 shuffle 后切分，
+    #    保证每个集合里各种组合都有。
+    traj_ids = df["traj_id"].unique().tolist()
     n_total = len(traj_ids)
     if n_total == 0:
         raise RuntimeError("CSV 中没有任何 traj_id")
 
-    n_train = max(1, int(n_total * train_ratio))
-    n_val = max(1, int(n_total * val_ratio))
-    # 其余全部给 test，避免加和误差
-    n_test = max(1, n_total - n_train - n_val)
-    if n_train + n_val + n_test > n_total:
-        # 如果因为 max(1, ...) 导致超过了，就微调一下
-        n_test = n_total - n_train - n_val
-        if n_test <= 0:
-            n_test = max(1, n_total - n_train)
+    split_seed = int(data_cfg.get("split_seed", data_cfg.get("random_seed", 42)))
+    traj_meta = _build_traj_meta(df)
 
-    train_ids = traj_ids[:n_train]
-    val_ids = traj_ids[n_train : n_train + n_val]
-    test_ids = traj_ids[n_train + n_val : n_train + n_val + n_test]
+    train_ids, val_ids, test_ids = _stratified_split_ids(
+        traj_ids=traj_ids,
+        meta=traj_meta,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=split_seed,
+    )
+
+    print(
+        f"[Split] 分层划分(按 motion_model × traj_type, seed={split_seed}): "
+        f"train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)} "
+        f"(total={n_total})"
+    )
 
     # 3) 先构造“未增量、未归一化”的窗口
     train_in, train_out = _make_windows_for_ids(df, train_ids, in_len, out_len)
