@@ -12,6 +12,9 @@ gnn1/code/data/generate_data.py
   position:   [3]         float32   我方固定目标 xyz（km），每样本独立
   label:      ()          int8      5 个候选终点中离 position 最近的索引 k*
                                     （通常 == k_seed，但噪声大时会翻）
+  soft_label: [5]         float32   (仅当 data.soft_label_tau > 0 时产出)
+                                    soft_k = softmax(-dist_k / tau)
+                                    和 = 1，给训练用软 CE，避免预测 100% 极端
 
 坐标系约定：
   - history 所在 window 的"最后一帧位置" 设为原点 (0, 0, 0)；
@@ -107,6 +110,9 @@ def generate_for_split(
     type_lo, type_hi = data_cfg.get("type_range", [0, 2])
     type_lo, type_hi = int(type_lo), int(type_hi)
 
+    soft_tau = float(data_cfg.get("soft_label_tau", 0.0))
+    save_soft = soft_tau > 0.0
+
     # ---- Step A: 对每个 window，一次性解码 5 条候选到 xy ----
     # 把 history 的最后一帧位置作为原点 (0,0)。
     # 注意：由于我们不需要绝对坐标，只需一致的相对坐标即可，直接令 hist_last_xy=(0,0)。
@@ -128,6 +134,7 @@ def generate_for_split(
     out_position = np.empty((n_samples, 3), dtype=np.float32)
     out_label = np.empty(n_samples, dtype=np.int8)
     out_k_seed = np.empty(n_samples, dtype=np.int8)  # 调试用，记录当时用的 k_seed
+    out_soft_label = np.empty((n_samples, M), dtype=np.float32) if save_soft else None
 
     save_targets = targets is not None
     if save_targets:
@@ -167,6 +174,14 @@ def generate_for_split(
             dists = np.linalg.norm(diffs, axis=-1)
             label = int(np.argmin(dists))
 
+            # ---- soft label = softmax(-dist / tau) ----
+            # 数值稳定：先减去最小值（等价变换）
+            if save_soft:
+                neg = -dists / soft_tau
+                neg = neg - neg.max()
+                exp_neg = np.exp(neg)
+                soft = exp_neg / exp_neg.sum()       # [M]，和 = 1
+
             # ---- 上下文采样 ----
             type_i = int(rng.integers(type_lo, type_hi + 1))
 
@@ -179,6 +194,8 @@ def generate_for_split(
             out_position[write_idx, 2] = pos_z_default
             out_label[write_idx] = label
             out_k_seed[write_idx] = k_seed
+            if save_soft:
+                out_soft_label[write_idx] = soft
             if save_targets:
                 out_targets[write_idx] = targets[n]
             write_idx += 1
@@ -192,6 +209,8 @@ def generate_for_split(
         "label": out_label,
         "k_seed": out_k_seed,   # 调试/健康检查用
     }
+    if save_soft:
+        res["soft_label"] = out_soft_label   # [N_samples, M]，训练用
     if save_targets:
         res["targets"] = out_targets     # [N_samples, Tout, D] GT，eval 用
     return res
@@ -258,6 +277,20 @@ def main() -> None:
         print(f"       label dist= {dist}")
         print(f"       P(label != k_seed) = {flip_ratio:.3f}   "
               f"(健康范围 0.10 ~ 0.30；>0.5 说明噪声太大，<0.05 说明太小)")
+        if "soft_label" in out:
+            soft = out["soft_label"].astype(np.float64)
+            M = soft.shape[-1]
+            # 平均最大概率（看"赢家"典型多大）
+            avg_max = float(soft.max(axis=-1).mean())
+            # 排序后 top-1/2/3 平均概率
+            srt = -np.sort(-soft, axis=-1)   # 降序
+            avg_top = srt.mean(axis=0)       # [M]
+            # 归一化熵 ∈ [0,1]，1 = 均匀
+            H = -np.sum(soft * np.log(soft + 1e-12), axis=-1)
+            H_norm = float((H / np.log(M)).mean())
+            top_str = "  ".join(f"top{k + 1}={avg_top[k]:.3f}" for k in range(min(3, M)))
+            print(f"       soft_label: avg_max={avg_max:.3f}  H_norm={H_norm:.3f}  "
+                  f"({top_str})")
 
     print("[gen] 完成。")
 

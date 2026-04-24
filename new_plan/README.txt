@@ -40,10 +40,12 @@ hist_traj ─► OutlierFilter ─► LSTM1 ─► 候选轨迹 [B,M=5,10,6]
 说明：
 - LSTM1 与 old_plan 几乎一样，**仅去掉 `mode_logits` 输出**（概率由下游 GNN1 算），
   输出 M=5 条候选。
-- GNN1 的功能是"轨迹选择"，对 5 条候选打分。Fusion 层取 top-3 概率并重归一化
-  使其和为 1，之后下游 ConstraintOptimizer / LSTM2 / GNN2 对这 3 条**各跑一次**
-  （[B*3, ...] 批量展开），产出的 intent/threat/strike 每条候选不同。
-- K = 3 来自 gnn1/config.yaml 的 train.keep_top_k；改它即可改最终 mode 数。
+- GNN1 的功能是"轨迹选择"，对 5 条候选打分。**GNN1 内部直接做 top-K + 重归一化**，
+  forward 返回 `top_idx [B, K]` 和 `top_probs [B, K]`（K 条和 = 1）。Fusion 层
+  只是拿 GNN1 的这两个字段做 gather，之后下游 ConstraintOptimizer / LSTM2 / GNN2
+  对这 K 条**各跑一次**（[B*K, ...] 批量展开），产出的 intent/threat/strike
+  每条候选不同。
+- K = 3 来自 gnn1/config.yaml 的 model.top_k；改它即可改最终 mode 数。
 - 其他子网络（约束优化 / LSTM2 / GNN2）当前都是**骨架 + TODO**，等接口定稿后再补。
 - fusion 把各子网络串起来，输出保持 `[B, K=3, 68]`，以兼容现有部署端 cpp。
 

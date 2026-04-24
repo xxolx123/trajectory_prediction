@@ -10,13 +10,19 @@ Gnn1Selector：Attention-based 候选轨迹打分器。
     position:    [B, 3]         我方固定目标 xyz（km，局部 ENU）
 
 输出:
-    {"logits": [B, M], "probs": [B, M]}
+    {
+      "logits":    [B, M],      # 训练 CE 用
+      "probs":     [B, M],      # softmax over M（可选用来诊断）
+      "top_idx":   [B, K],      # top-K 候选在 0..M-1 里的索引（按概率降序）
+      "top_probs": [B, K],      # 对 top-K 概率重归一化，K 条和 = 1
+    }
 
 结构:
     1) 类别 embedding + position MLP → concat → MLP(ctx) → [B, d_emb]
     2) 候选编码：LSTM 读每条候选 → 末态 → [B, M, d_emb]
     3) Cross-Attention: Q = ctx.unsqueeze(1), K = V = cand_emb
     4) per-candidate score: concat(cand_emb, attended_ctx) → MLP → 1 logit
+    5) topk(probs, k=top_k) + 重归一化 → top_idx / top_probs
 """
 
 from __future__ import annotations
@@ -44,9 +50,18 @@ class Gnn1Config:
     n_heads: int = 4
     dropout: float = 0.1
 
+    # top-K 输出（由 forward 内部 topk + 重归一化产出）
+    top_k: int = 3
+
     # 词汇表大小
     task_type_vocab: int = DEFAULT_TASK_TYPE_VOCAB
     type_vocab: int = DEFAULT_TYPE_VOCAB
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.top_k <= self.n_modes):
+            raise ValueError(
+                f"top_k ({self.top_k}) 必须在 [1, n_modes={self.n_modes}]"
+            )
 
 
 class _MLP(nn.Module):
@@ -144,8 +159,19 @@ class Gnn1Selector(nn.Module):
         ctx_expand = attn_out.expand(-1, M, -1)                 # [B, M, d_emb]
         feat = torch.cat([cand_emb, ctx_expand], dim=-1)        # [B, M, 2*d_emb]
         logits = self.score_head(feat).squeeze(-1)              # [B, M]
-        probs = torch.softmax(logits, dim=-1)
-        return {"logits": logits, "probs": probs}
+        probs = torch.softmax(logits, dim=-1)                    # [B, M]
+
+        # top-K + 重归一化；部署侧（fusion）直接用这两个字段
+        K = self.cfg.top_k
+        top_p_raw, top_idx = torch.topk(probs, k=K, dim=-1)      # [B, K]
+        top_probs = top_p_raw / top_p_raw.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        return {
+            "logits":    logits,
+            "probs":     probs,
+            "top_idx":   top_idx,
+            "top_probs": top_probs,
+        }
 
 
 # ------------------------------------------------------------
@@ -167,6 +193,7 @@ def build_model_from_config(cfg: Dict[str, Any]) -> Gnn1Selector:
         d_emb=int(model_cfg.get("d_emb", 64)),
         n_heads=int(model_cfg.get("n_heads", 4)),
         dropout=float(model_cfg.get("dropout", 0.1)),
+        top_k=int(model_cfg.get("top_k", 3)),
         task_type_vocab=DEFAULT_TASK_TYPE_VOCAB,
         type_vocab=type_hi + 1,
     )

@@ -24,9 +24,16 @@ data:
   type_range:     [0, 2]     # 我方固定目标类型（0/1/2 共 3 种）
 
   # position = y_{k_seed} 终点 + ext × step_len × dir + 高斯噪声
-  position_ext_steps:   [1.0, 5.0]    # ext 的 [lo, hi]，以"候选最后一步位移"为单位
+  position_ext_steps:   [1.0, 10.0]   # ext 的 [lo, hi]，以"候选最后一步位移"为单位
   position_noise_km:    0.3           # 噪声 σ；让一部分样本 label 会翻到邻近 mode
   position_z:           0.0           # 默认 z 坐标
+
+  # soft label：根据 position 到 5 个 endpoint 的距离算 soft 概率分布
+  #   soft_k = softmax(-dist_k / tau)        tau 单位 km
+  #   - tau 越小越接近 hard argmin；越大越平
+  #   - 典型距离几 km 时，推荐 0.5 ~ 1.5 km
+  #   - 设为 0 = 关闭 soft label，只产 hard label（退回旧行为）
+  soft_label_tau:       1.0
 
   random_seed: 42
 
@@ -41,12 +48,17 @@ model:
   fut_len:   10
   feat_dim:  6
 
+  # forward() 里会把 probs 取 top_k 并重新归一化，多返回
+  # top_idx / top_probs（K 条和 = 1）。fusion / 部署侧直接拿这两个字段。
+  # 必须满足 1 <= top_k <= n_modes。
+  top_k:     3
+
 train:
   device:       "auto"       # "auto" / "cuda" / "cpu" / "mps"
   seed:         42
 
-  batch_size:   128
-  num_epochs:   20
+  batch_size:   256
+  num_epochs:   10
 
   lr:           1.0e-3
   weight_decay: 1.0e-5
@@ -57,5 +69,12 @@ train:
   ckpt_dir:     "checkpoints"
   log_interval: 100
 
-  # 可选 CE label smoothing
+  # loss 选择：
+  #   "ce"      → hard CrossEntropy（用 batch["label"]），配合 label_smoothing
+  #   "soft_ce" → 软标签 CE（用 batch["soft_label"]，需要 generate_data 时
+  #                        data.soft_label_tau > 0 产出）
+  #   推荐 "soft_ce"：避免 top1 概率推到 100%，得到"有差别"的 5 条分布
+  loss_mode:       "soft_ce"
+
+  # hard CE 模式下的 label smoothing；soft_ce 模式下忽略
   label_smoothing: 0.0

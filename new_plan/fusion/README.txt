@@ -14,10 +14,11 @@ fusion/  —— 把所有子网络拼成 FullNetV2 + 导出 ONNX
 作用
 ----
 1) 加载各子网络 ckpt（lstm1 必加；其他可选、可无）；
-2) 把 OutlierFilter → LSTM1 → GNN1（选轨迹概率） → top-K + 重归一化
+2) 把 OutlierFilter → LSTM1 → GNN1（选轨迹概率 + 内部 top-K + 重归一化）
    → ConstraintOptimizer → LSTM2 → GNN2 串起来；
 3) 对外输出 [B, K, 68] 的单一张量，**与 old_plan 部署端完全兼容**：
-   其中 K 来自 gnn1/config.yaml 的 train.keep_top_k（默认 3）。
+   其中 K 来自 gnn1/config.yaml 的 model.top_k（默认 3），**GNN1 自己负责 topk**，
+   fusion 只是拿它的 top_idx / top_probs 做 gather 和展平。
       0..59 : 未来 10 步 × 6 维（每条候选各自）
       60    : intent_class (argmax(LSTM2.logits_intent))      每条候选各自
       61    : threat_prob  (sigmoid(LSTM2.threat_raw))        每条候选各自
@@ -39,13 +40,12 @@ fusion/  —— 把所有子网络拼成 FullNetV2 + 导出 ONNX
       ▼
   LSTM1 ──►  M=5 候选 [B,5,10,6]（归一化+delta 空间）
                 │
-    (task_type, type, position) ──► GNN1
+    (task_type, type, position) ──► GNN1（内含 topk + renorm）
                                       │
-                                   probs [B,5]
+                                   top_idx  [B,K]
+                                   top_probs[B,K]  (K 条和 = 1)
                                       │
-                           topk(K) + renorm sum=1
-                                      │
-                         top-K 归一化候选
+                         gather → top-K 归一化候选
                                       │
                            反归一化 + cumsum
                                       │
@@ -101,7 +101,7 @@ fusion/config.yaml 配置各子网络的指向：
     ckpt:   "../lstm1/checkpoints/<run_id>/best_lstm_epoch*.pt"
     scaler: "../lstm1/data/processed/scaler_posvel.npz"   # 必填
   gnn1:
-    config: "../gnn1/config.yaml"           # 从里面读 train.keep_top_k 作为 K
+    config: "../gnn1/config.yaml"           # 从里面读 model.top_k 作为 K
     ckpt:   ""                              # 空字符串 = 用随机权重
   constraint_optimizer:
     config: "../constraint_optimizer/config.yaml"

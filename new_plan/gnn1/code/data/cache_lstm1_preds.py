@@ -30,19 +30,52 @@ import yaml
 
 
 # =============== 让我们能 import lstm1 的代码 ===============
+#
+# 坑：gnn1/code/data/ 和 lstm1/code/data/ 包同名（namespace package），
+#     `python -m data.cache_lstm1_preds` 启动后 sys.modules['data'].__path__
+#     已固化到 gnn1 侧，后补 lstm1/code 到 sys.path 不生效。
+#     因此这里用 importlib.util.spec_from_file_location 按**文件路径**直接
+#     加载 lstm1 的 traj_dataset.py / train/model.py，彻底绕开包查找。
 
-def _ensure_lstm1_importable(lstm1_root: Path) -> None:
-    """把 lstm1/code 加到 sys.path，以便可以 `from data.traj_dataset import ...`
-    和 `from train.model import ...`。"""
+def _load_module_from_file(module_name: str, file_path: Path):
+    """按文件路径直接加载一个模块，绕开 sys.path / namespace package。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法从 {file_path} 构造 spec for {module_name}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_lstm1_build_fns(lstm1_root: Path):
+    """
+    返回 (build_datasets_from_config, build_model_from_config) 两个函数，
+    分别来自 lstm1/code/data/traj_dataset.py 和 lstm1/code/train/model.py。
+    """
     lstm1_code = (lstm1_root / "code").resolve()
     if not lstm1_code.exists():
         raise FileNotFoundError(
             f"找不到 lstm1 代码目录：{lstm1_code}。"
             "请检查 config.yaml 里 lstm1.config_path 是否指向正确的 lstm1/config.yaml。"
         )
+
+    # 顺带把 lstm1/code 加到 sys.path 末尾，供 lstm1 内部模块的"隐式同项目导入"兜底
     s = str(lstm1_code)
     if s not in sys.path:
-        sys.path.insert(0, s)
+        sys.path.append(s)
+
+    traj_dataset_path = lstm1_code / "data" / "traj_dataset.py"
+    model_path = lstm1_code / "train" / "model.py"
+    if not traj_dataset_path.is_file():
+        raise FileNotFoundError(f"找不到 {traj_dataset_path}")
+    if not model_path.is_file():
+        raise FileNotFoundError(f"找不到 {model_path}")
+
+    td_mod = _load_module_from_file("_lstm1_traj_dataset", traj_dataset_path)
+    mdl_mod = _load_module_from_file("_lstm1_model", model_path)
+    return td_mod.build_datasets_from_config, mdl_mod.build_model_from_config
 
 
 # =============== 工具：查找最新 ckpt ===============
@@ -96,13 +129,12 @@ def main() -> None:
     if not lstm1_cfg_abs.exists():
         raise FileNotFoundError(f"找不到 lstm1 config：{lstm1_cfg_abs}")
     lstm1_root = lstm1_cfg_abs.parent
-    _ensure_lstm1_importable(lstm1_root)
 
-    # 延迟 import：必须在 sys.path 补好之后
+    # 按文件路径直接加载 lstm1 的两个入口函数，绕开 gnn1/lstm1 同名 `data` 包冲突
+    build_datasets_from_config, build_model_from_config = _load_lstm1_build_fns(lstm1_root)
+
     import torch  # noqa: E402
     from torch.utils.data import DataLoader  # noqa: E402
-    from data.traj_dataset import build_datasets_from_config  # type: ignore  # noqa: E402
-    from train.model import build_model_from_config  # type: ignore  # noqa: E402
 
     # --- 设备 ---
     dev_str = args.device.lower()

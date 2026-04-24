@@ -28,6 +28,10 @@ ENV/
 *.pkl
 *.pickle
 
+# ============ Large data arrays (cache / generated samples) ============
+*.npz
+*.npy
+
 # ============ Training artifacts ============
 checkpoints/
 

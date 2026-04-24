@@ -8,7 +8,8 @@ __getitem__ 返回 dict（全部是 torch.Tensor）：
     task_type:   long    ()               敌方作战任务（目前只有 0 = 打击）
     type:        long    ()               我方固定目标类型（0/1/2）
     position:    float32 [3]              我方固定目标 xyz km
-    label:       long    ()
+    label:       long    ()               hard argmin label（top-1 accuracy 永远用它）
+    soft_label:  float32 [M]              （可选）soft CE 训练用，和 = 1
 """
 
 from __future__ import annotations
@@ -57,6 +58,10 @@ class Gnn1Dataset(torch.utils.data.Dataset):
         if "targets" in data.files:
             self.targets = data["targets"].astype(np.float32)
 
+        self.soft_label: Optional[np.ndarray] = None
+        if "soft_label" in data.files:
+            self.soft_label = data["soft_label"].astype(np.float32)
+
         self._n = int(self.candidates.shape[0])
         self._M = int(self.candidates.shape[1])
         self._T = int(self.candidates.shape[2])
@@ -80,6 +85,8 @@ class Gnn1Dataset(torch.utils.data.Dataset):
             item["k_seed"] = torch.tensor(int(self.k_seed[idx]), dtype=torch.long)
         if self.targets is not None:
             item["targets"] = torch.from_numpy(self.targets[idx])  # [Tout, D]
+        if self.soft_label is not None:
+            item["soft_label"] = torch.from_numpy(self.soft_label[idx])  # [M]
         return item
 
     # 一些方便的元信息

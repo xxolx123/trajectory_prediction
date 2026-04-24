@@ -141,7 +141,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         out = model(batch)                           # logits [B, M]
-        loss, comps = loss_fn(out["logits"], batch["label"])
+        loss, comps = loss_fn(out["logits"], batch["label"], batch.get("soft_label"))
         loss.backward()
 
         # 梯度裁剪
@@ -214,7 +214,7 @@ def evaluate(
             batch = _to_device(batch, device)
             B = int(batch["label"].size(0))
             out = model(batch)
-            loss, comps = loss_fn(out["logits"], batch["label"])
+            loss, comps = loss_fn(out["logits"], batch["label"], batch.get("soft_label"))
             total_loss += float(loss.detach().cpu().item())
             total_top1 += float(comps["top1"].detach().cpu().item()) * B
             total_samples += B
@@ -346,21 +346,37 @@ def run_smoke(cfg: Dict[str, Any]) -> None:
 
     B = 4
     torch.manual_seed(0)
+    # 造一个随机 soft_label（和 = 1）；不论 loss_mode 是哪种都给上，让 loss_fn 决定用不用
+    _raw_soft = torch.rand(B, n_modes)
+    _soft_label = _raw_soft / _raw_soft.sum(dim=-1, keepdim=True)
     batch = {
         "cand_trajs": torch.randn(B, n_modes, fut_len, feat_dim),
         "task_type": torch.zeros(B, dtype=torch.long),
         "type": torch.randint(0, type_hi + 1, (B,), dtype=torch.long),
         "position": torch.randn(B, 3),
         "label": torch.randint(0, n_modes, (B,), dtype=torch.long),
+        "soft_label": _soft_label,
     }
 
     out = model(batch)
     assert out["logits"].shape == (B, n_modes)
     print(f"[Smoke] logits shape = {tuple(out['logits'].shape)}  ok")
 
+    # top-K 字段校验
+    top_k = int(model_cfg.get("top_k", 3))
+    assert out["top_idx"].shape == (B, top_k), out["top_idx"].shape
+    assert out["top_probs"].shape == (B, top_k), out["top_probs"].shape
+    top_sum = out["top_probs"].sum(dim=-1)
+    err = (top_sum - 1.0).abs().max().item()
+    assert err < 1e-5, f"top-K renorm 失败: max |sum-1| = {err}"
+    print(f"[Smoke] top-K: idx {tuple(out['top_idx'].shape)}, "
+          f"probs {tuple(out['top_probs'].shape)}, "
+          f"max |sum-1| = {err:.2e}  ok")
+
     loss_fn = build_loss_from_config(cfg)
-    loss, comps = loss_fn(out["logits"], batch["label"])
-    print(f"[Smoke] loss = {float(loss):.4f}  top1 = {float(comps['top1']):.3f}")
+    loss, comps = loss_fn(out["logits"], batch["label"], batch.get("soft_label"))
+    print(f"[Smoke] loss_mode = {loss_fn.cfg.mode}  "
+          f"loss = {float(loss):.4f}  top1 = {float(comps['top1']):.3f}")
 
     loss.backward()
     # 查几个关键模块的梯度

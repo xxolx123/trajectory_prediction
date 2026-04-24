@@ -11,10 +11,14 @@ gnn1/code/train/eval.py
          - Oracle: label（= argmin(endpoint→position)）
   3) 若 cache 中保存了 targets（GT 未来），再算 ADE / FDE（km）
      对比同样三种策略。
+  4) 可选：从该 split 随机挑 --vis-n 个样本画可视化（含 5 条候选的概率 +
+     top-3 重归一化概率），保存到 --vis-outdir。
 
 用法（在 new_plan/gnn1/ 下）:
     $env:PYTHONPATH = "$PWD/code"
-    python -m train.eval --config config.yaml --split test [--ckpt <path>]
+    python -m train.eval --config config.yaml --split test
+    python -m train.eval --config config.yaml --split test --vis-n 0    # 只评估不画图
+    python -m train.eval --config config.yaml --split test --vis-n 8 --vis-outdir eval_vis
 """
 
 from __future__ import annotations
@@ -24,12 +28,17 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import yaml
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))   # .../code/train
 CODE_DIR = os.path.dirname(THIS_DIR)                    # .../code
@@ -106,9 +115,236 @@ def decode_to_xy(feat_norm: np.ndarray, scaler: _Scaler) -> np.ndarray:
     return np.cumsum(dxy, axis=-2)
 
 
+# =================== 可视化 ===================
+
+_PALETTE = ["tab:blue", "tab:orange", "tab:green", "tab:purple", "tab:brown"]
+
+
+def _grid_layout(n: int):
+    if n <= 3:
+        return 1, n
+    if n <= 6:
+        return 2, int(np.ceil(n / 2))
+    if n <= 9:
+        return 3, int(np.ceil(n / 3))
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+    return rows, cols
+
+
+def _plot_eval_sample(
+    ax: plt.Axes,
+    sample_idx: int,
+    cand_xy: np.ndarray,           # [M, T, 2]
+    position: np.ndarray,          # [3]
+    label: int,
+    k_seed: int,
+    task_type: int,
+    type_id: int,
+    gt_xy: Optional[np.ndarray],   # [T, 2] or None
+    probs: np.ndarray,             # [M]   GNN1 对 M 条候选的 softmax 概率
+    top_idx: np.ndarray,           # [K]   GNN1 选的 top-K 索引（降序）
+    top_probs: np.ndarray,         # [K]   top-K 重归一化概率（和 = 1）
+    noise_sigma_km: float,
+) -> None:
+    M, T, _ = cand_xy.shape
+    top_set = set(int(i) for i in top_idx)
+    top1 = int(top_idx[0])
+    correct = (top1 == label)
+
+    # 1) 候选轨迹
+    for m in range(M):
+        is_label = (m == label)
+        is_top = (m in top_set)
+        color = _PALETTE[m % len(_PALETTE)]
+
+        if is_top:
+            lw, alpha = 2.4, 1.0
+            z = 3
+        else:
+            lw, alpha = 1.0, 0.45
+            z = 2
+        ax.plot(cand_xy[m, :, 0], cand_xy[m, :, 1],
+                color=color, linewidth=lw, alpha=alpha, zorder=z)
+
+        # 端点：label = 实心圆；top-k 非 label = 方块；其余 = 三角
+        ex, ey = cand_xy[m, -1, 0], cand_xy[m, -1, 1]
+        if is_label:
+            ax.scatter(ex, ey, s=90, color=color,
+                       edgecolors="black", linewidths=1.4,
+                       marker="o", zorder=5)
+        elif is_top:
+            ax.scatter(ex, ey, s=60, color=color,
+                       edgecolors="black", linewidths=1.0,
+                       marker="s", zorder=4)
+        else:
+            ax.scatter(ex, ey, s=30, color=color,
+                       marker="^", alpha=0.6, zorder=3)
+
+        # 在端点附近标该候选的 prob，突出 top1
+        prob_txt = f"{probs[m] * 100:.1f}%"
+        if is_top:
+            prob_txt = f"cand{m}: {prob_txt}"
+            if m == top1:
+                prob_txt = f"★{prob_txt}"
+        weight = "bold" if is_top else "normal"
+        ax.annotate(prob_txt, xy=(ex, ey),
+                    xytext=(6, 6), textcoords="offset points",
+                    fontsize=7.5, color=color, weight=weight,
+                    alpha=1.0 if is_top else 0.6)
+
+    # 2) 原点
+    ax.scatter(0, 0, s=55, color="black", marker="*", zorder=6)
+
+    # 3) position
+    ax.scatter(position[0], position[1], s=230, color="red",
+               marker="*", edgecolors="black", linewidths=1.2, zorder=7)
+    if noise_sigma_km > 0:
+        circ = Circle(
+            (position[0], position[1]),
+            radius=noise_sigma_km,
+            fill=False, linestyle="--", linewidth=1.0,
+            edgecolor="red", alpha=0.55, zorder=1,
+        )
+        ax.add_patch(circ)
+
+    # 4) GT
+    if gt_xy is not None:
+        ax.plot(gt_xy[:, 0], gt_xy[:, 1],
+                color="black", linestyle="--", linewidth=1.4,
+                alpha=0.85, zorder=3)
+        ax.scatter(gt_xy[:, 0], gt_xy[:, 1],
+                   s=12, color="black", marker="o", zorder=4)
+
+    # 5) 标题 + top-3 信息
+    top3_str = ", ".join(
+        f"c{int(i)}:{float(p) * 100:.1f}%"
+        for i, p in zip(top_idx, top_probs)
+    )
+    flag = "OK" if correct else "X"
+    title = (
+        f"idx={sample_idx}  task={task_type}  type={type_id}\n"
+        f"label={label}  top1={top1} ({flag})  k_seed={k_seed}\n"
+        f"top-K (renorm): [{top3_str}]"
+    )
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel("x (km)")
+    ax.set_ylabel("y (km)")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+
+
+def _render_eval_samples(
+    ds,
+    model: torch.nn.Module,
+    device: torch.device,
+    scaler: Optional[_Scaler],
+    chosen: List[int],
+    noise_sigma_km: float,
+    split: str,
+    ckpt_name: str,
+    outdir: Path,
+    show: bool = False,
+) -> None:
+    n = len(chosen)
+    if n == 0:
+        return
+    if scaler is None:
+        print("[Eval/Vis] 没找到 scaler，可视化需要反归一化；跳过。")
+        return
+
+    # 一次性 forward 这 n 个样本
+    batch_list = [ds[i] for i in chosen]
+    batch = {
+        k: torch.stack([b[k] for b in batch_list], dim=0)
+        for k in batch_list[0].keys()
+    }
+    batch_dev = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+
+    model.eval()
+    with torch.no_grad():
+        out = model(batch_dev)
+    probs = out["probs"].cpu().numpy()            # [n, M]
+    top_idx = out["top_idx"].cpu().numpy()        # [n, K]
+    top_probs = out["top_probs"].cpu().numpy()    # [n, K]
+
+    cand_np = batch["cand_trajs"].numpy()          # [n, M, T, D]
+    cand_xy = decode_to_xy(cand_np, scaler)        # [n, M, T, 2]
+
+    have_gt = ("targets" in batch)
+    if have_gt:
+        gt_np = batch["targets"].numpy()           # [n, T, D]
+        gt_xy = decode_to_xy(gt_np, scaler)        # [n, T, 2]
+    else:
+        gt_xy = None
+
+    pos_np = batch["position"].numpy()             # [n, 3]
+    labels = batch["label"].numpy()
+    task_arr = batch["task_type"].numpy()
+    type_arr = batch["type"].numpy()
+    if "k_seed" in batch:
+        k_seed_arr = batch["k_seed"].numpy()
+    else:
+        k_seed_arr = np.full(n, -1, dtype=np.int64)
+
+    rows, cols = _grid_layout(n)
+    fig_w = max(5.0 * cols, 5.5)
+    fig_h = max(4.8 * rows, 5.0)
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h))
+    axes = np.array(axes).reshape(-1)
+
+    for k, idx in enumerate(chosen):
+        _plot_eval_sample(
+            ax=axes[k],
+            sample_idx=int(idx),
+            cand_xy=cand_xy[k],
+            position=pos_np[k],
+            label=int(labels[k]),
+            k_seed=int(k_seed_arr[k]),
+            task_type=int(task_arr[k]),
+            type_id=int(type_arr[k]),
+            gt_xy=(gt_xy[k] if have_gt else None),
+            probs=probs[k],
+            top_idx=top_idx[k],
+            top_probs=top_probs[k],
+            noise_sigma_km=noise_sigma_km,
+        )
+    for k in range(n, rows * cols):
+        axes[k].axis("off")
+
+    fig.suptitle(
+        f"GNN1 eval | split={split} | n={n} | ckpt={ckpt_name}",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = outdir / f"gnn1_eval_{split}_{stamp}.png"
+    fig.savefig(out_path, dpi=140)
+    print(f"[Eval/Vis] saved: {out_path}")
+    print(f"[Eval/Vis] indices = {chosen}")
+    if show:
+        try:
+            matplotlib.use("TkAgg", force=True)
+            plt.show()
+        except Exception as e:
+            print(f"[Eval/Vis] show 失败：{e}")
+    plt.close(fig)
+
+
 # =================== 评估主流程 ===================
 
-def evaluate(config_path: str, ckpt_path: Optional[str], split: str) -> None:
+def evaluate(
+    config_path: str,
+    ckpt_path: Optional[str],
+    split: str,
+    vis_n: int = 5,
+    vis_outdir: str = "eval_vis",
+    vis_seed: int = 42,
+    vis_indices: Optional[List[int]] = None,
+) -> None:
     gnn1_root = Path(__file__).resolve().parents[2]
 
     cfg_path = Path(config_path)
@@ -259,8 +495,41 @@ def evaluate(config_path: str, ckpt_path: Optional[str], split: str) -> None:
 
     print("=" * 60)
 
+    # ---- 可视化 N 个样本（含 5 条候选的概率 + top-3 重归一化概率） ----
+    if vis_n > 0 or vis_indices:
+        if vis_indices:
+            for i in vis_indices:
+                if not (0 <= i < len(ds)):
+                    raise ValueError(f"vis_indices 里的 {i} 越界 [0, {len(ds)})")
+            chosen = list(vis_indices)
+        else:
+            rng_vis = np.random.default_rng(vis_seed)
+            n_want = min(int(vis_n), len(ds))
+            chosen = sorted(rng_vis.choice(len(ds), size=n_want, replace=False).tolist())
+
+        vis_dir = Path(vis_outdir)
+        if not vis_dir.is_absolute():
+            vis_dir = (gnn1_root / vis_dir).resolve()
+
+        _render_eval_samples(
+            ds=ds,
+            model=model,
+            device=device,
+            scaler=scaler,
+            chosen=chosen,
+            noise_sigma_km=float(data_cfg.get("position_noise_km", 0.3)),
+            split=split,
+            ckpt_name=p.name,
+            outdir=vis_dir,
+            show=False,
+        )
+
 
 # =================== CLI ===================
+
+def _parse_indices(s: str) -> List[int]:
+    return [int(x) for x in s.replace(" ", "").split(",") if x]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -268,8 +537,24 @@ def main() -> None:
     parser.add_argument("--ckpt", type=str, default="")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "val", "test"])
+    parser.add_argument("--vis-n", type=int, default=5,
+                        help="评估完后额外画 N 个样本（默认 5；设为 0 关闭）")
+    parser.add_argument("--vis-indices", type=str, default="",
+                        help="逗号分隔的样本索引（会覆盖 --vis-n 的随机挑法）")
+    parser.add_argument("--vis-seed", type=int, default=42,
+                        help="随机挑样本用的 seed")
+    parser.add_argument("--vis-outdir", type=str, default="eval_vis",
+                        help="可视化 png 保存目录（相对 gnn1 根目录）")
     args = parser.parse_args()
-    evaluate(args.config, args.ckpt or None, args.split)
+
+    vis_indices = _parse_indices(args.vis_indices) if args.vis_indices else None
+    evaluate(
+        args.config, args.ckpt or None, args.split,
+        vis_n=int(args.vis_n),
+        vis_outdir=args.vis_outdir,
+        vis_seed=int(args.vis_seed),
+        vis_indices=vis_indices,
+    )
 
 
 if __name__ == "__main__":

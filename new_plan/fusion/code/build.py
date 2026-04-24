@@ -92,7 +92,8 @@ def build_subnetworks(
     返回 (lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A, lstm1_modes, top_k)
 
     - lstm1_modes: LSTM1 的候选数 M（来自 lstm1_cfg.model.modes）
-    - top_k:       Fusion 保留的候选数（来自 gnn1_cfg.train.keep_top_k，缺省 3）
+    - top_k:       GNN1 保留的 top-K（来自 gnn1_cfg.model.top_k，缺省 3）
+                   注意：这是 GNN1 输出结构参数，不是 train.keep_top_k（那是 ckpt 保留策略）
     """
 
     # ---- LSTM1 ----
@@ -125,8 +126,8 @@ def build_subnetworks(
     gnn1 = build_gnn1(gnn1_cfg)
     _try_load_state_dict(gnn1, _resolve_rel(sec.get("ckpt", ""), fusion_cfg_dir), "GNN1")
 
-    top_k = int(gnn1_cfg.get("train", {}).get("keep_top_k", 3))
-    print(f"[Fusion] GNN1: lstm1_modes={lstm1_modes}, keep_top_k={top_k}")
+    top_k = int(gnn1_cfg.get("model", {}).get("top_k", 3))
+    print(f"[Fusion] GNN1: lstm1_modes={lstm1_modes}, top_k={top_k}")
 
     # ---- ConstraintOptimizer ----
     sec = fusion_cfg.get("constraint_optimizer", {})
