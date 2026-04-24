@@ -84,9 +84,15 @@ def _try_load_state_dict(model: torch.nn.Module, ckpt_path: Optional[Path], tag:
 def build_subnetworks(
     fusion_cfg: Dict[str, Any],
     fusion_cfg_dir: Path,
-) -> Tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module, np.ndarray, np.ndarray]:
+) -> Tuple[
+    torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module,
+    np.ndarray, np.ndarray, int, int,
+]:
     """
-    返回 (lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A)
+    返回 (lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A, lstm1_modes, top_k)
+
+    - lstm1_modes: LSTM1 的候选数 M（来自 lstm1_cfg.model.modes）
+    - top_k:       Fusion 保留的候选数（来自 gnn1_cfg.train.keep_top_k，缺省 3）
     """
 
     # ---- LSTM1 ----
@@ -97,6 +103,8 @@ def build_subnetworks(
     lstm1_cfg = _load_yaml(cfg_path)
     lstm1 = build_lstm1(lstm1_cfg)
     _try_load_state_dict(lstm1, _resolve_rel(sec.get("ckpt", ""), fusion_cfg_dir), "LSTM1")
+
+    lstm1_modes = int(lstm1_cfg.get("model", {}).get("modes", 5))
 
     scaler_path = _resolve_rel(sec.get("scaler", ""), fusion_cfg_dir)
     if scaler_path is not None and scaler_path.exists():
@@ -116,6 +124,9 @@ def build_subnetworks(
     gnn1_cfg = _load_yaml(cfg_path)
     gnn1 = build_gnn1(gnn1_cfg)
     _try_load_state_dict(gnn1, _resolve_rel(sec.get("ckpt", ""), fusion_cfg_dir), "GNN1")
+
+    top_k = int(gnn1_cfg.get("train", {}).get("keep_top_k", 3))
+    print(f"[Fusion] GNN1: lstm1_modes={lstm1_modes}, keep_top_k={top_k}")
 
     # ---- ConstraintOptimizer ----
     sec = fusion_cfg.get("constraint_optimizer", {})
@@ -144,7 +155,7 @@ def build_subnetworks(
     gnn2 = build_gnn2(gnn2_cfg)
     _try_load_state_dict(gnn2, _resolve_rel(sec.get("ckpt", ""), fusion_cfg_dir), "GNN2")
 
-    return lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A
+    return lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A, lstm1_modes, top_k
 
 
 def load_fusion_config(fusion_cfg_path: Path) -> Tuple[Dict[str, Any], Path]:

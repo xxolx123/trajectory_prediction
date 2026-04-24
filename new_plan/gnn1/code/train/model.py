@@ -1,120 +1,173 @@
 """
 gnn1/code/train/model.py
 ------------------------
-TrajSelectionGNN：根据"LSTM1 的 M 条候选 + 目标信息"给每条轨迹打分。
+Gnn1Selector：Attention-based 候选轨迹打分器。
 
-当前实现（**占位**）：纯 MLP
-    轨迹 flatten + ctx flatten → concat → MLP → [B, M] logit → softmax
+输入 batch (来自 gnn1/code/data/dataset.py):
+    cand_trajs:  [B, M, T, D]   LSTM1 候选（归一化 + delta 空间）
+    task_type:   [B]   long     敌方作战任务（目前只有 0 = 打击）
+    type:        [B]   long     我方固定目标类型（0/1/2）
+    position:    [B, 3]         我方固定目标 xyz（km，局部 ENU）
 
-TODO（后续替换为真正的 GNN）：
-    节点 = M 条轨迹（用 LSTM/Conv 聚合成向量）+ N_tgt 个固定目标节点 + 1 个全局节点
-    边   = 轨迹↔目标（按轨迹终点到目标的距离建权）
-           轨迹↔全局 / 目标↔全局（全连接）
-           轨迹↔轨迹（按终点相似度，可选）
-    消息传递 2~3 层 GraphSAGE / GAT
-    读出 = 只在"轨迹节点"上接 Linear → 1 维 logit → softmax
+输出:
+    {"logits": [B, M], "probs": [B, M]}
+
+结构:
+    1) 类别 embedding + position MLP → concat → MLP(ctx) → [B, d_emb]
+    2) 候选编码：LSTM 读每条候选 → 末态 → [B, M, d_emb]
+    3) Cross-Attention: Q = ctx.unsqueeze(1), K = V = cand_emb
+    4) per-candidate score: concat(cand_emb, attended_ctx) → MLP → 1 logit
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict
 
 import torch
 from torch import nn
 
-# 把 new_plan/ 加到 sys.path，便于 `from common.context_schema import ...`
-_REPO_ROOT = Path(__file__).resolve().parents[3]  # .../new_plan
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
-from common.context_schema import (  # noqa: E402
-    ContextBatch,
-    flatten_context_for_mlp,
-    flattened_ctx_dim,
-)
+# 默认容量：防御性使用，让 config 缺字段时也能跑
+DEFAULT_TASK_TYPE_VOCAB = 1     # 目前只有 0 = 打击
+DEFAULT_TYPE_VOCAB = 3          # 我方固定目标类型 0..2
 
 
-class TrajSelectionGNN(nn.Module):
-    def __init__(
-        self,
-        n_modes: int,
-        fut_len: int,
-        feat_dim: int,
-        ctx_dims: Dict[str, Any],
-        hidden: int = 128,
-        dropout: float = 0.0,
-    ) -> None:
+@dataclass
+class Gnn1Config:
+    n_modes: int = 5
+    fut_len: int = 10
+    feat_dim: int = 6
+
+    d_cat: int = 16
+    d_emb: int = 64
+    n_heads: int = 4
+    dropout: float = 0.1
+
+    # 词汇表大小
+    task_type_vocab: int = DEFAULT_TASK_TYPE_VOCAB
+    type_vocab: int = DEFAULT_TYPE_VOCAB
+
+
+class _MLP(nn.Module):
+    def __init__(self, dims, dropout: float = 0.0, last_act: bool = False) -> None:
         super().__init__()
-        self.n_modes = int(n_modes)
-        self.fut_len = int(fut_len)
-        self.feat_dim = int(feat_dim)
-        self.hidden = int(hidden)
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            is_last = i == len(dims) - 2
+            if (not is_last) or last_act:
+                layers.append(nn.ReLU(inplace=True))
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+        self.net = nn.Sequential(*layers)
 
-        traj_in = self.fut_len * self.feat_dim
-        self.traj_encoder = nn.Sequential(
-            nn.Linear(traj_in, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Gnn1Selector(nn.Module):
+    """Attention-based selector，给 M 条候选打分。"""
+
+    def __init__(self, cfg: Gnn1Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        # ---- 上下文侧 ----
+        self.task_emb = nn.Embedding(cfg.task_type_vocab, cfg.d_cat)
+        self.type_emb = nn.Embedding(cfg.type_vocab, cfg.d_cat)
+        self.pos_mlp = _MLP([3, cfg.d_cat], dropout=cfg.dropout, last_act=True)
+
+        # 3 段 concat：task_emb + type_emb + pos_vec
+        self.ctx_mlp = _MLP([3 * cfg.d_cat, cfg.d_emb, cfg.d_emb],
+                            dropout=cfg.dropout, last_act=False)
+
+        # ---- 候选轨迹编码 ----
+        self.cand_encoder = nn.LSTM(
+            input_size=cfg.feat_dim,
+            hidden_size=cfg.d_emb,
+            num_layers=1,
+            batch_first=True,
+            dropout=0.0,
         )
 
-        ctx_in = flattened_ctx_dim(ctx_dims)
-        self.ctx_encoder = nn.Sequential(
-            nn.Linear(ctx_in, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+        # ---- Cross-attention: Q=ctx, K=V=candidates ----
+        self.attn = nn.MultiheadAttention(
+            embed_dim=cfg.d_emb,
+            num_heads=cfg.n_heads,
+            dropout=cfg.dropout,
+            batch_first=True,
         )
+        self.attn_ln = nn.LayerNorm(cfg.d_emb)
 
-        self.scorer = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
+        # ---- Scoring head: 每个候选独立得一个分数 ----
+        self.score_head = _MLP([2 * cfg.d_emb, cfg.d_emb, 1],
+                               dropout=cfg.dropout, last_act=False)
 
-    def forward(self, cand_trajs: torch.Tensor, ctx: ContextBatch) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            cand_trajs: [B, M, T, D]
-            ctx:        ContextBatch
-        Returns:
-            {"traj_logits": [B, M], "traj_probs": [B, M]}
-        """
+    # ---------- forward ----------
+
+    def _encode_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """batch 中各类别 long、position [B,3] → ctx [B, d_emb]"""
+        t_task = self.task_emb(batch["task_type"])      # [B, d_cat]
+        t_type = self.type_emb(batch["type"])           # [B, d_cat]
+        p_vec = self.pos_mlp(batch["position"])         # [B, d_cat]
+        ctx = torch.cat([t_task, t_type, p_vec], dim=-1)  # [B, 3*d_cat]
+        return self.ctx_mlp(ctx)                        # [B, d_emb]
+
+    def _encode_candidates(self, cand_trajs: torch.Tensor) -> torch.Tensor:
+        """cand_trajs [B, M, T, D] → [B, M, d_emb]"""
         B, M, T, D = cand_trajs.shape
-        if M != self.n_modes or T != self.fut_len or D != self.feat_dim:
-            raise ValueError(
-                f"cand_trajs 形状 [B,M,T,D]=[{B},{M},{T},{D}] 与配置 "
-                f"[M={self.n_modes},T={self.fut_len},D={self.feat_dim}] 不一致"
-            )
+        flat = cand_trajs.reshape(B * M, T, D)
+        _, (h_n, _) = self.cand_encoder(flat)
+        # h_n: [num_layers, B*M, d_emb] → 取最后一层
+        cand_emb = h_n[-1].reshape(B, M, -1)
+        return cand_emb
 
-        flat = cand_trajs.reshape(B, M, T * D)
-        traj_emb = self.traj_encoder(flat)  # [B, M, H]
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        cand_trajs = batch["cand_trajs"].float()                # [B, M, T, D]
+        B, M, T, D = cand_trajs.shape
+        cfg = self.cfg
+        assert M == cfg.n_modes and T == cfg.fut_len and D == cfg.feat_dim, (
+            f"cand_trajs 形状 [B,M,T,D]=[{B},{M},{T},{D}] 与 cfg "
+            f"[M={cfg.n_modes},T={cfg.fut_len},D={cfg.feat_dim}] 不一致"
+        )
 
-        ctx_flat = flatten_context_for_mlp(ctx)
-        ctx_emb = self.ctx_encoder(ctx_flat)  # [B, H]
-        ctx_emb_expand = ctx_emb.unsqueeze(1).expand(-1, M, -1)  # [B, M, H]
+        ctx = self._encode_context(batch)                       # [B, d_emb]
+        cand_emb = self._encode_candidates(cand_trajs)          # [B, M, d_emb]
 
-        scorer_in = torch.cat([traj_emb, ctx_emb_expand], dim=-1)  # [B, M, 2H]
-        logits = self.scorer(scorer_in).squeeze(-1)                # [B, M]
+        # Cross attention
+        ctx_q = ctx.unsqueeze(1)                                # [B, 1, d_emb]
+        attn_out, _ = self.attn(ctx_q, cand_emb, cand_emb)      # [B, 1, d_emb]
+        attn_out = self.attn_ln(attn_out + ctx_q)               # residual + LN
+
+        # 打分
+        ctx_expand = attn_out.expand(-1, M, -1)                 # [B, M, d_emb]
+        feat = torch.cat([cand_emb, ctx_expand], dim=-1)        # [B, M, 2*d_emb]
+        logits = self.score_head(feat).squeeze(-1)              # [B, M]
         probs = torch.softmax(logits, dim=-1)
-        return {"traj_logits": logits, "traj_probs": probs}
+        return {"logits": logits, "probs": probs}
 
 
-def build_model_from_config(cfg: Dict[str, Any]) -> TrajSelectionGNN:
-    model_cfg = cfg.get("model", {})
-    ctx_cfg = cfg.get("context", {})
-    ctx_dims = {k: ctx_cfg.get(k) for k in (
-        "target_task_dim", "n_fixed_targets", "fixed_target_dim",
-        "target_type_dim", "road_network_dim", "own_info_dim",
-    )}
-    return TrajSelectionGNN(
-        n_modes=int(model_cfg.get("n_modes", 3)),
+# ------------------------------------------------------------
+# 构造工具
+# ------------------------------------------------------------
+
+def build_model_from_config(cfg: Dict[str, Any]) -> Gnn1Selector:
+    model_cfg = cfg.get("model", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
+
+    # type_vocab：用 config 里 type_range 的上界 + 1（我方固定目标类型 0..2）
+    type_hi = int((data_cfg.get("type_range") or [0, 2])[1])
+
+    gcfg = Gnn1Config(
+        n_modes=int(model_cfg.get("n_modes", 5)),
         fut_len=int(model_cfg.get("fut_len", 10)),
         feat_dim=int(model_cfg.get("feat_dim", 6)),
-        ctx_dims=ctx_dims,
-        hidden=int(model_cfg.get("hidden_size", 128)),
-        dropout=float(model_cfg.get("dropout", 0.0)),
+        d_cat=int(model_cfg.get("d_cat", 16)),
+        d_emb=int(model_cfg.get("d_emb", 64)),
+        n_heads=int(model_cfg.get("n_heads", 4)),
+        dropout=float(model_cfg.get("dropout", 0.1)),
+        task_type_vocab=DEFAULT_TASK_TYPE_VOCAB,
+        type_vocab=type_hi + 1,
     )
+    return Gnn1Selector(gcfg)

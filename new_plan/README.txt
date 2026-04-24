@@ -3,22 +3,28 @@ new_plan/  —— 轨迹预测新方案（多子网络 + 融合）
 
 总体架构
 --------
-hist_traj ─► OutlierFilter ─► LSTM1 ─► 候选轨迹 [B,M,10,6]
+hist_traj ─► OutlierFilter ─► LSTM1 ─► 候选轨迹 [B,M=5,10,6]
                                            │
-  (target_task / fixed_targets /           │
-   target_type / road_network)  ──────────►│
+  (task_type / type / position) ──────────►│
                                            ▼
                                   GNN1（选轨迹概率）
                                            │
-                                           ▼ argmax
-                                   主轨迹 [B,10,6]
+                                           ▼
+                                    probs [B, 5]
                                            │
-  (road_network / target_task) ───────────►│
+                              topk(K=3) + 重归一化
+                                           │
+                                           ▼
+                             top-3 候选 [B, 3, 10, 6]
+                                           │
+                        reshape → [B*3, 10, 6]  (下游按每条候选各跑一次)
+                                           │
+  (road_points / road_mask) ──────────────►│
                                            ▼
                                ConstraintOptimizer
                                            │
                                            ▼
-                                 精修预测轨迹 [B,10,6]
+                              精修 [B*3, 10, 6]
                                            │
          ┌─────────────────────────────────┼──────────────────────────┐
          ▼                                 ▼                          │
@@ -28,14 +34,34 @@ hist_traj ─► OutlierFilter ─► LSTM1 ─► 候选轨迹 [B,M,10,6]
          └────────────────────────────►│                               │
                                        │                               │
                                        ▼                               ▼
-                            [strike_pos, radius, conf]      最终 [B,M,68]
+                            [strike_pos, radius, conf]      最终 [B, 3, 68]
                                                             （兼容旧 deploy）
 
 说明：
-- LSTM1 与 old_plan 几乎一样，**仅去掉 `mode_logits` 输出**（概率由下游 GNN1 算）。
-- GNN1 的功能是"轨迹选择"，不再修正终点。
+- LSTM1 与 old_plan 几乎一样，**仅去掉 `mode_logits` 输出**（概率由下游 GNN1 算），
+  输出 M=5 条候选。
+- GNN1 的功能是"轨迹选择"，对 5 条候选打分。Fusion 层取 top-3 概率并重归一化
+  使其和为 1，之后下游 ConstraintOptimizer / LSTM2 / GNN2 对这 3 条**各跑一次**
+  （[B*3, ...] 批量展开），产出的 intent/threat/strike 每条候选不同。
+- K = 3 来自 gnn1/config.yaml 的 train.keep_top_k；改它即可改最终 mode 数。
 - 其他子网络（约束优化 / LSTM2 / GNN2）当前都是**骨架 + TODO**，等接口定稿后再补。
-- fusion 把各子网络串起来，输出保持 `[B, M, 68]`，以兼容现有部署端 cpp。
+- fusion 把各子网络串起来，输出保持 `[B, K=3, 68]`，以兼容现有部署端 cpp。
+
+
+ContextBatch 字段归属
+--------
+common/context_schema.py 里的 ContextBatch 是单一真相源，字段按消费者划分：
+
+  task_type   [B]            long    ──► GNN1
+  type        [B]            long    ──► GNN1     (我方固定目标类型 0..2)
+  position    [B, 3]         float   ──► GNN1     (我方固定目标 xyz km)
+  road_points [B, N_max, 3]  float   ──► ConstraintOptimizer
+  road_mask   [B, N_max]     bool    ──► ConstraintOptimizer
+  own_info    [B, D_own]     float   ──► LSTM2 / GNN2 (占位)
+
+路网结构匹配 C++ 侧 RoadNetwork = vector<RoadBranchLLH>；当前 v1 只支持单主干道
+（变长点数 + padding + mask），多分支扩展留 TODO。部署时 lon/lat/alt → 局部 ENU km
+的转换在 C++ 侧做。
 
 
 目录结构（每个子网络一个独立工程 + 一个公共文件夹 + 一个 fusion）
@@ -154,7 +180,9 @@ TODO 全清单（等外部接口 / 数据确定后来补）
 - lstm1/ 的 data 脚本（generate_trajs / traj_dataset / visualize_trajs）基本是
   从 old_plan/203_prediction_multi_pytorch_without_map_v0.2 拷贝过来的；
   model.py / loss.py 去掉了 mode_logits / 分类损失，其余保持一致。
-- 旧的 model_fusion_v0 被 fusion/ 取代；输出布局 [B,M,68] 完全兼容。
+- 旧的 model_fusion_v0 被 fusion/ 取代；输出布局 [B, K=3, 68] 完全兼容
+  （old_plan 就是 3 条）。差异：new_plan 的 60..66 字段**每条候选不同**
+  （下游 LSTM2/GNN2 对 3 条各跑一次），old_plan 的下游字段对 3 条广播同值。
 
 
 与部署端的关系

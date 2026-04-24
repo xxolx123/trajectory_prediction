@@ -26,6 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from common.context_schema import (  # noqa: E402
     ContextBatch,
+    build_ctx_dims_from_config,
     flatten_context_for_mlp,
     flattened_ctx_dim,
 )
@@ -46,6 +47,7 @@ class StrikeZoneGNN(nn.Module):
         self.feat_dim = int(feat_dim)
         self.intent_feat_dim = int(intent_feat_dim)
         self.hidden = int(hidden)
+        self.ctx_dims = dict(ctx_dims)
 
         traj_in = self.fut_len * self.feat_dim
         self.traj_encoder = nn.Sequential(
@@ -87,7 +89,7 @@ class StrikeZoneGNN(nn.Module):
             )
 
         traj_emb = self.traj_encoder(pred_traj.reshape(B, T * D))
-        ctx_emb = self.ctx_encoder(flatten_context_for_mlp(ctx))
+        ctx_emb = self.ctx_encoder(flatten_context_for_mlp(ctx, self.ctx_dims))
         intent_emb = self.intent_encoder(intent_feat)
         merged = torch.cat([traj_emb, ctx_emb, intent_emb], dim=-1)
         raw = self.head(merged)  # [B, 5]
@@ -100,11 +102,8 @@ class StrikeZoneGNN(nn.Module):
 
 def build_model_from_config(cfg: Dict[str, Any]) -> StrikeZoneGNN:
     m = cfg.get("model", {})
-    ctx_cfg = cfg.get("context", {})
-    ctx_dims = {k: ctx_cfg.get(k) for k in (
-        "target_task_dim", "n_fixed_targets", "fixed_target_dim",
-        "target_type_dim", "road_network_dim", "own_info_dim",
-    )}
+    # 用公共 helper 读 context 段，默认值来自 DEFAULT_CTX_DIMS
+    ctx_dims = build_ctx_dims_from_config(cfg)
     return StrikeZoneGNN(
         fut_len=int(m.get("fut_len", 10)),
         feat_dim=int(m.get("feat_dim", 6)),

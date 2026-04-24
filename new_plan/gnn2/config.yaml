@@ -10,12 +10,13 @@ data:
   test_ratio: 0.1
 
 context:
-  target_task_dim: 8
-  n_fixed_targets: 4
-  fixed_target_dim: 4
-  target_type_dim: 4
-  road_network_dim: 16
-  own_info_dim: 4
+  # 新 ContextBatch schema（与 common/context_schema.py 对齐）
+  task_type_vocab:  1      # 敌方作战任务（目前只有 0 = 打击）
+  type_vocab:       3      # 我方固定目标类型 0..2
+  position_dim:     3      # 我方固定目标 xyz km
+  road_max_points:  128    # 路网主干道 padding 上限（GNN2 不消费，只为 flatten 对齐）
+  road_point_dim:   3
+  own_info_dim:     4
 
 model:
   type: "gnn2_mlp_stub"     # TODO: "strike_zone_gnn"

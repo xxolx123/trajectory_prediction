@@ -25,9 +25,11 @@ gnn2:
   ckpt:   ""
 
 # FullNetV2 自己需要的参数（必须与各子网络对齐）
+# 注意：最终输出的 K（top-K）不在这里配置，实际以 gnn1/config.yaml 的
+#       train.keep_top_k 为准。LSTM1 的 M（候选数）来自 lstm1/config.yaml 的
+#       model.modes。assert 保证 top_k <= lstm1_modes。
 full_net:
   hist_len: 20
   fut_len: 10
   feature_dim: 6
-  n_modes: 3
   use_delta_A: true

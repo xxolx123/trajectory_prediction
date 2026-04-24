@@ -3,15 +3,22 @@ constraint_optimizer/code/train/module.py
 -----------------------------------------
 约束优化模块（骨架）。
 
-当前实现：pass，直接返回输入。
+当前实现：pass_through，直接返回输入。
+
+路网输入归本模块管：
+    ctx.road_points  [B, N_max, 3]   km-xyz，主干道折线点
+    ctx.road_mask    [B, N_max]      bool，True = 有效点
+
 TODO（二选一，或混合）：
     (a) 算法型：
-        - 路网 link 投影
+        - 路网 link 投影：把 trajectory 点拉到最近的 road_points 连线上
+          (记得用 ctx.road_mask 过滤 padding 点)
         - 速度/加速度夹取
         - 任务区域边界裁剪
     (b) 可学习型：
         - 用 MLP 出残差 Δtraj，然后 refined = selected + Δtraj
         - 训练 loss：(reconstruction MSE) + (约束违反惩罚)
+        - road_points / road_mask 作为 set-encoder 的输入之一
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ class ConstraintOptimizer(nn.Module):
         if not self.enable:
             return selected_traj
         if self.module_type == "pass_through":
+            # TODO: 将来真正实现时从 ctx.road_points / ctx.road_mask 读主干路网
             _ = ctx
             return selected_traj
         # TODO: 其它类型

@@ -1,41 +1,61 @@
 # =============================================================================
-# gnn1 配置（骨架占位）
-# TODO: 等 data/generate_data.py 确定后，补齐 data 段的参数
+# gnn1 配置
+# 依赖冻结的 lstm1 ckpt 离线缓存 5 条候选，再构造 (candidates, context, label)
+# 的监督样本，训练一个 Attention-based Selector 输出 5 个候选的概率。
 # =============================================================================
 
-data:
-  raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
+lstm1:
+  # lstm1 的 config 相对于 gnn1/ 根目录的路径；脚本里也会兜底解析绝对路径
+  config_path: "../lstm1/config.yaml"
+  # lstm1 的 ckpt；可以是具体文件，也可以是目录（将自动选最新 .pt）
+  ckpt_path:   "../lstm1/checkpoints"
 
-# 与 common/context_schema.py 对齐；等真实接口定了再改
-context:
-  target_task_dim: 8
-  n_fixed_targets: 4
-  fixed_target_dim: 4
-  target_type_dim: 4
-  road_network_dim: 16
-  # GNN1 不用 own_info，但 ContextBatch 统一有这个字段，占位维度即可
-  own_info_dim: 4
+data:
+  # 目录（相对于 gnn1/ 根目录）
+  cache_dir: "data/cache"    # cache_lstm1_preds.py 写这里
+  raw_dir:   "data/raw"      # generate_data.py   写这里
+
+  # 样本规模
+  samples_per_window: 5      # 每个 window 遍历 k_seed 的次数；= 5 让 label 均衡
+                             # 设为 N 时会循环 k_seed = i % 5
+
+  # 上下文字段的采样范围（闭区间）
+  task_type_fixed: 0         # 敌方作战任务（目前只有 0 = 打击）
+  type_range:     [0, 2]     # 我方固定目标类型（0/1/2 共 3 种）
+
+  # position = y_{k_seed} 终点 + ext × step_len × dir + 高斯噪声
+  position_ext_steps:   [1.0, 5.0]    # ext 的 [lo, hi]，以"候选最后一步位移"为单位
+  position_noise_km:    0.3           # 噪声 σ；让一部分样本 label 会翻到邻近 mode
+  position_z:           0.0           # 默认 z 坐标
+
+  random_seed: 42
 
 model:
-  type: "gnn1_mlp_stub"    # TODO: 替换成 "traj_selection_gnn"
-  # 候选轨迹参数（要与 lstm1 一致）
-  n_modes: 3
-  fut_len: 10
-  feat_dim: 6
-  # MLP / GNN 隐藏层
-  hidden_size: 128
-  dropout: 0.0
+  d_cat:   16                # 类别 embedding 维度
+  d_emb:   64                # 候选 / context 向量维度
+  n_heads: 4                 # MultiheadAttention 头数
+  dropout: 0.1
+
+  # 与 lstm1 对齐（如果改了这里务必改 lstm1 config）
+  n_modes:   5
+  fut_len:   10
+  feat_dim:  6
 
 train:
-  device: "auto"
-  seed: 42
-  batch_size: 64
-  num_epochs: 10
-  lr: 1.0e-3
+  device:       "auto"       # "auto" / "cuda" / "cpu" / "mps"
+  seed:         42
+
+  batch_size:   128
+  num_epochs:   20
+
+  lr:           1.0e-3
   weight_decay: 1.0e-5
-  ckpt_dir: "checkpoints"
+
+  grad_clip:    1.0
+  keep_top_k:   3
+
+  ckpt_dir:     "checkpoints"
   log_interval: 100
+
+  # 可选 CE label smoothing
+  label_smoothing: 0.0
