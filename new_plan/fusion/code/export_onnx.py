@@ -45,7 +45,8 @@ class FullNetV2ForOnnx(nn.Module):
         self.full_net = full_net
         self.ctx_dims = dict(ctx_dims)
 
-        N_max = int(ctx_dims["road_max_points"])
+        NB_max = int(ctx_dims.get("road_max_branches", 1))
+        NP_max = int(ctx_dims["road_max_points"])
         D_road = int(ctx_dims["road_point_dim"])
         D_pos = int(ctx_dims["position_dim"])
         D_own = int(ctx_dims["own_info_dim"])
@@ -54,9 +55,9 @@ class FullNetV2ForOnnx(nn.Module):
         self.register_buffer("_ctx_task_type", torch.zeros(1, dtype=torch.long))
         self.register_buffer("_ctx_type", torch.zeros(1, dtype=torch.long))
         self.register_buffer("_ctx_position", torch.zeros(1, D_pos))
-        # ConstraintOptimizer 用
-        self.register_buffer("_ctx_road_points", torch.zeros(1, N_max, D_road))
-        self.register_buffer("_ctx_road_mask", torch.zeros(1, N_max, dtype=torch.bool))
+        # ConstraintOptimizer 用（多分支）
+        self.register_buffer("_ctx_road_points", torch.zeros(1, NB_max, NP_max, D_road))
+        self.register_buffer("_ctx_road_mask", torch.zeros(1, NB_max, NP_max, dtype=torch.bool))
         # LSTM2 / GNN2 占位
         self.register_buffer("_ctx_own_info", torch.zeros(1, D_own))
 
@@ -66,8 +67,8 @@ class FullNetV2ForOnnx(nn.Module):
             task_type=self._ctx_task_type.expand(B).contiguous(),
             type=self._ctx_type.expand(B).contiguous(),
             position=self._ctx_position.expand(B, -1).contiguous(),
-            road_points=self._ctx_road_points.expand(B, -1, -1).contiguous(),
-            road_mask=self._ctx_road_mask.expand(B, -1).contiguous(),
+            road_points=self._ctx_road_points.expand(B, -1, -1, -1).contiguous(),
+            road_mask=self._ctx_road_mask.expand(B, -1, -1).contiguous(),
             own_info=self._ctx_own_info.expand(B, -1).contiguous(),
         )
         return self.full_net(x_raw, ctx)

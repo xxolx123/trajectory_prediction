@@ -12,15 +12,15 @@ common/context_schema.py
     type            [B]        long   我方固定目标类型 (0/1/2)
     position        [B, 3]     float  我方固定目标 xyz km（局部 ENU，以 hist 最后一帧为原点）
 
-  ConstraintOptimizer 会用（单主干道 v1）:
-    road_points     [B, N_max, 3]  float  路网主干道点的 xyz km
-    road_mask       [B, N_max]     bool   有效点掩码
+  ConstraintOptimizer 会用（多分支 v2）:
+    road_points     [B, NB_max, NP_max, 3]  float  每条分支折线点的 xyz km
+    road_mask       [B, NB_max, NP_max]     bool   有效点掩码（按点；某条分支整条无效就把该
+                                                   分支所有 NP 个点全置 False）
 
   LSTM2 / GNN2 侧占位:
     own_info        [B, D_own]  float  我方自身信息（占位，待接入）
 
 TODO（等接口定稿）:
-  - 多分支路网: road_points 升到 [B, N_branch_max, N_point_max, 3] + branch_mask
   - 部署端 C++ 侧需要把 RoadPointLLH (lon/lat/alt) → 局部 ENU (km) 后再喂进来
   - own_info 的维度 / 字段含义待甲方给出
 
@@ -43,8 +43,9 @@ DEFAULT_CTX_DIMS: Dict[str, Any] = {
     "type_vocab": 3,        # 我方固定目标类型 0..2
     "position_dim": 3,      # xyz km
 
-    # ConstraintOptimizer 相关（单主干道 v1）
-    "road_max_points": 128,
+    # ConstraintOptimizer 相关（多分支 v2）
+    "road_max_branches": 4,   # 每个 batch 最多多少条分支
+    "road_max_points": 128,   # 每条分支最多多少个折线点
     "road_point_dim": 3,
 
     # LSTM2 / GNN2 占位
@@ -60,8 +61,8 @@ class ContextBatch:
     position: torch.Tensor        # [B, 3]     float
 
     # ---- ConstraintOptimizer 会用 ----
-    road_points: torch.Tensor     # [B, N_max, 3]  float
-    road_mask: torch.Tensor       # [B, N_max]     bool
+    road_points: torch.Tensor     # [B, NB_max, NP_max, 3]  float
+    road_mask: torch.Tensor       # [B, NB_max, NP_max]     bool
 
     # ---- LSTM2 / GNN2 占位 ----
     own_info: torch.Tensor        # [B, D_own]  float
@@ -92,7 +93,8 @@ def build_dummy_context(
         device = torch.device("cpu")
 
     B = int(batch_size)
-    N_max = int(ctx_dims["road_max_points"])
+    NB_max = int(ctx_dims.get("road_max_branches", 1))
+    NP_max = int(ctx_dims["road_max_points"])
     D_road = int(ctx_dims["road_point_dim"])
     D_pos = int(ctx_dims["position_dim"])
     D_own = int(ctx_dims["own_info_dim"])
@@ -101,8 +103,8 @@ def build_dummy_context(
         task_type=torch.zeros(B, device=device, dtype=torch.long),
         type=torch.zeros(B, device=device, dtype=torch.long),
         position=torch.zeros(B, D_pos, device=device, dtype=dtype),
-        road_points=torch.zeros(B, N_max, D_road, device=device, dtype=dtype),
-        road_mask=torch.zeros(B, N_max, device=device, dtype=torch.bool),
+        road_points=torch.zeros(B, NB_max, NP_max, D_road, device=device, dtype=dtype),
+        road_mask=torch.zeros(B, NB_max, NP_max, device=device, dtype=torch.bool),
         own_info=torch.zeros(B, D_own, device=device, dtype=dtype),
     )
 

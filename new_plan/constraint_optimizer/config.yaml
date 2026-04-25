@@ -1,20 +1,12 @@
 # =============================================================================
-# constraint_optimizer 配置（骨架占位）
-# 当前：算法型 pass 版本，不需要任何超参
-# 未来：若改可学习版，来这里加 train/model 段
+# constraint_optimizer 配置
 # =============================================================================
 
 module:
-  enable: true       # 整体开关，方便 ablation
-  type: "pass_through"   # TODO: "road_projection" / "mlp_residual" / ...
-
-# TODO: 若走可学习路线，取消下面注释
-# train:
-#   device: "auto"
-#   seed: 42
-#   batch_size: 64
-#   num_epochs: 10
-#   lr: 1.0e-3
-#   weight_decay: 1.0e-5
-#   ckpt_dir: "checkpoints"
-#   log_interval: 100
+  enable: true             # 整体开关，方便 ablation
+  # 可选:
+  #   "pass_through"          原样返回
+  #   "road_projection"       逐点硬投影到最近线段（旧实现，会"穿过路网空白处"）
+  #   "road_arc_projection"   沿弧长投影（推荐）：每条候选选一条最匹配的分支，
+  #                           按累积弧长贴在该分支上，输出严格沿路网折线走
+  type: "road_arc_projection"
