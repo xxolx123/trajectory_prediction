@@ -59,6 +59,7 @@ STRAIGHT_CFG: Dict[str, Any]
 TURN_CFG: Dict[str, Any]
 S_CURVE_CFG: Dict[str, Any]
 U_TURN_CFG: Dict[str, Any]
+STATIONARY_CFG: Dict[str, Any]   # 近似静止 + 微小漂移
 
 # 初始位姿
 INIT_X_RANGE: Tuple[float, float]
@@ -67,6 +68,18 @@ INIT_Z_RANGE: Tuple[float, float]
 
 USE_VERTICAL_MOTION: bool
 VERTICAL_VZ_RANGE_KMPS: Tuple[float, float]
+
+# 过程噪声（每步累积，模拟动力学模型不确定性）
+ENABLE_PROCESS_NOISE: bool
+PROCESS_POS_STD_KM: float       # 位置过程噪声 σ（km，每步独立采样后累加到 x,y,z）
+PROCESS_VEL_STD_KMPS: float     # 速度过程噪声 σ（km/s，每步独立采样后累加到 vx,vy,vz）
+PROCESS_VZ_STD_KMPS: float      # z 方向速度过程噪声 σ（km/s）
+
+# 量测噪声（仅作用在写出的观测值上，不累积；模拟传感器噪声）
+ENABLE_MEASUREMENT_NOISE: bool
+MEAS_POS_STD_KM: float          # 位置量测噪声 σ（km）
+MEAS_VEL_STD_KMPS: float        # vx/vy 量测噪声 σ（km/s）
+MEAS_VZ_STD_KMPS: float         # vz 量测噪声 σ（km/s）
 
 RANDOM_SEED: int
 
@@ -129,9 +142,11 @@ def apply_data_config(cfg: Dict[str, Any], project_root: Path) -> None:
     global SPEED_RANGE_KMH, MIN_SPEED_KMH
     global MAX_ACCEL_MPS2, MAX_DECEL_MPS2, MAX_YAW_RATE_DEG_S
     global SPEED_SEGMENTS_RANGE, SPEED_JITTER_KMH, ALLOW_STOP, STOP_PROB
-    global STRAIGHT_CFG, TURN_CFG, S_CURVE_CFG, U_TURN_CFG
+    global STRAIGHT_CFG, TURN_CFG, S_CURVE_CFG, U_TURN_CFG, STATIONARY_CFG
     global INIT_X_RANGE, INIT_Y_RANGE, INIT_Z_RANGE
     global USE_VERTICAL_MOTION, VERTICAL_VZ_RANGE_KMPS
+    global ENABLE_PROCESS_NOISE, PROCESS_POS_STD_KM, PROCESS_VEL_STD_KMPS, PROCESS_VZ_STD_KMPS
+    global ENABLE_MEASUREMENT_NOISE, MEAS_POS_STD_KM, MEAS_VEL_STD_KMPS, MEAS_VZ_STD_KMPS
     global RANDOM_SEED
     global RAW_DIR, OUTPUT_CSV_NAME
 
@@ -156,7 +171,7 @@ def apply_data_config(cfg: Dict[str, Any], project_root: Path) -> None:
     TRAJ_TYPES = list(
         data_cfg.get(
             "traj_types",
-            ["straight", "left_turn", "right_turn", "s_curve", "u_turn"],
+            ["straight", "left_turn", "right_turn", "s_curve", "u_turn", "stationary"],
         )
     )
 
@@ -260,6 +275,46 @@ def apply_data_config(cfg: Dict[str, Any], project_root: Path) -> None:
     if U_TURN_CFG["direction"] not in ("left", "right", "random"):
         raise ValueError("u_turn.direction 只能是 left/right/random")
 
+    # --- stationary（近似静止：形状复用现有低速运动 + 极小速度） ---
+    # 速度被限制在一个极小区间（远低于 min_speed_kmh），所以走单独采样路径，
+    # 不受 SPEED_RANGE_KMH / MIN_SPEED_KMH 影响。
+    # yaw-rate 不再用纯随机漂移（不符合现实运动），而是从 sub_types 里
+    # 随机选一种"正常运动模式"（除 u_turn 外）复用其 yaw-rate 形状，
+    # 配合极慢速度模拟"低速通过 / 泊车机动 / 等待中微挪"等场景。
+    STATIONARY_CFG = dict(data_cfg.get("stationary", {}) or {})
+    STATIONARY_CFG["speed_kmh_range"] = _as_float_range(
+        STATIONARY_CFG.get("speed_kmh_range"),
+        "stationary.speed_kmh_range",
+        (0.0, 2.0),
+    )
+    STATIONARY_CFG["speed_jitter_kmh"] = float(
+        STATIONARY_CFG.get("speed_jitter_kmh", 0.3)
+    )
+    if STATIONARY_CFG["speed_jitter_kmh"] < 0:
+        raise ValueError("stationary.speed_jitter_kmh 必须 >= 0")
+    STATIONARY_CFG["full_stop_prob"] = float(
+        STATIONARY_CFG.get("full_stop_prob", 0.3)
+    )
+    if not (0.0 <= STATIONARY_CFG["full_stop_prob"] <= 1.0):
+        raise ValueError("stationary.full_stop_prob 必须在 [0, 1] 内")
+
+    sub_types = list(
+        STATIONARY_CFG.get(
+            "sub_types",
+            ["straight", "left_turn", "right_turn", "s_curve"],
+        )
+    )
+    allowed_sub_types = {"straight", "left_turn", "right_turn", "s_curve"}
+    if not sub_types:
+        raise ValueError("stationary.sub_types 不能为空")
+    for s in sub_types:
+        if s not in allowed_sub_types:
+            raise ValueError(
+                f"stationary.sub_types 含非法值 {s!r}；只允许 {sorted(allowed_sub_types)}"
+                "（u_turn 已显式排除：低速 + 大角度掉头不符合现实场景）"
+            )
+    STATIONARY_CFG["sub_types"] = sub_types
+
     # --- 约束冲突早期校验：角度下界 vs yaw-rate 上限 ---
     # 最短的 duration + 最大的 mag → 应不超过 max_yaw_rate
     max_yaw_rate_rad_s = math.radians(MAX_YAW_RATE_DEG_S)
@@ -294,6 +349,38 @@ def apply_data_config(cfg: Dict[str, Any], project_root: Path) -> None:
     VERTICAL_VZ_RANGE_KMPS = tuple(
         data_cfg.get("vertical_vz_range_kmps", [-0.005, 0.005])
     )  # type: ignore
+
+    # --- 过程噪声 / 量测噪声 ---
+    # 过程噪声：每一步前向积分后给状态加零均值高斯扰动，会随时间累积，
+    #         模拟"动力学模型不确定性"（例如未建模的扰动力）。
+    # 量测噪声：仅在 CSV 写出阶段给每个观测值独立加零均值高斯噪声，
+    #         不累积，模拟传感器噪声（GPS、IMU 等）。
+    noise_cfg = dict(data_cfg.get("noise", {}) or {})
+
+    ENABLE_PROCESS_NOISE = bool(noise_cfg.get("enable_process_noise", False))
+    PROCESS_POS_STD_KM = float(noise_cfg.get("process_pos_std_km", 0.0))
+    PROCESS_VEL_STD_KMPS = float(noise_cfg.get("process_vel_std_kmps", 0.0))
+    PROCESS_VZ_STD_KMPS = float(
+        noise_cfg.get("process_vz_std_kmps", PROCESS_VEL_STD_KMPS)
+    )
+
+    ENABLE_MEASUREMENT_NOISE = bool(noise_cfg.get("enable_measurement_noise", False))
+    MEAS_POS_STD_KM = float(noise_cfg.get("measurement_pos_std_km", 0.0))
+    MEAS_VEL_STD_KMPS = float(noise_cfg.get("measurement_vel_std_kmps", 0.0))
+    MEAS_VZ_STD_KMPS = float(
+        noise_cfg.get("measurement_vz_std_kmps", MEAS_VEL_STD_KMPS)
+    )
+
+    for name, val in [
+        ("process_pos_std_km", PROCESS_POS_STD_KM),
+        ("process_vel_std_kmps", PROCESS_VEL_STD_KMPS),
+        ("process_vz_std_kmps", PROCESS_VZ_STD_KMPS),
+        ("measurement_pos_std_km", MEAS_POS_STD_KM),
+        ("measurement_vel_std_kmps", MEAS_VEL_STD_KMPS),
+        ("measurement_vz_std_kmps", MEAS_VZ_STD_KMPS),
+    ]:
+        if val < 0:
+            raise ValueError(f"noise.{name} 必须 >= 0，得到 {val}")
 
     # --- 随机种子 ---
     RANDOM_SEED = int(data_cfg.get("random_seed", 42))
@@ -391,6 +478,36 @@ def sample_speed_profile_kmh(
                 profile[s:e] = 0.0
 
     return profile, int(K), bool(has_stop)
+
+
+def sample_stationary_speed_profile_kmh(
+    num_steps: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, int, bool]:
+    """近似静止目标的速度采样：
+
+    - 整条轨迹用一个非常小的"基准速度"（[v_lo, v_hi] 内随机），叠加高斯抖动；
+    - 以 full_stop_prob 概率，整条轨迹基准速度直接置 0（纯抖动）；
+    - 整体裁剪到 [0, max(v_hi, v_lo)]，**不受 MIN_SPEED_KMH 影响**。
+
+    返回与 sample_speed_profile_kmh 同构的 (profile, n_segments, has_stop)。
+    """
+    T = num_steps
+    v_lo, v_hi = STATIONARY_CFG["speed_kmh_range"]
+    jitter = float(STATIONARY_CFG["speed_jitter_kmh"])
+    full_stop_prob = float(STATIONARY_CFG["full_stop_prob"])
+
+    full_stop = rng.random() < full_stop_prob
+    base = 0.0 if full_stop else float(rng.uniform(v_lo, v_hi))
+
+    profile = np.full(T, base, dtype=np.float64)
+    if jitter > 0.0:
+        profile = profile + rng.normal(0.0, jitter, size=T)
+
+    v_cap = max(v_hi, v_lo, 0.0)
+    profile = np.clip(profile, 0.0, v_cap)
+
+    return profile, 1, bool(full_stop)
 
 
 def _sample_nonoverlap_segments(
@@ -520,6 +637,14 @@ def sample_yaw_rate_profile_rad_s(
             rng=rng,
             drift_deg_s=drift,
         )
+
+    if traj_type == "stationary":
+        # 近似静止：速度由 sample_stationary_speed_profile_kmh 单独采（极慢），
+        # 而 yaw-rate 形状复用其它正常运动类（除 u_turn），更贴近现实——
+        # 例如"低速直行 / 路口慢拐 / 泊车 S 弯"，而非随机抖动的"原地乱漂"。
+        sub_types = STATIONARY_CFG["sub_types"]
+        sub = str(rng.choice(sub_types))
+        return sample_yaw_rate_profile_rad_s(sub, num_steps, rng)
 
     if traj_type in ("left_turn", "right_turn"):
         sign = +1.0 if traj_type == "left_turn" else -1.0
@@ -651,35 +776,65 @@ def integrate_trajectory(
     use_vertical: bool,
     vz_range_kmps: Tuple[float, float],
     rng: np.random.Generator,
+    enable_process_noise: bool = False,
+    process_pos_std_km: float = 0.0,
+    process_vel_std_kmps: float = 0.0,
+    process_vz_std_kmps: float = 0.0,
 ) -> List[Tuple[float, float, float, float, float, float]]:
     """前向欧拉积分，输出与旧版 simulate_trajectory 同构：
        [(x, y, z, vx, vy, vz), ...]，长度 = len(speed_profile_kmh)
        单位：位置 km，速度 km/s
+
+    过程噪声（可选）：
+       - 每一步在按运动学算出名义 (vx,vy,vz) 后，给速度加零均值高斯扰动；
+         位置积分用"被扰动后的速度"，因此扰动会随步数累积；
+       - 同时在位置上也直接加一个独立的小高斯扰动（位置过程噪声），
+         相当于状态空间模型 Q 矩阵中 pos / vel 的对角项。
+       - 记录到 states 中的 (x,y,z,vx,vy,vz) 仍是"含过程噪声的真值"，
+         量测噪声会在更外层（写 CSV 时）单独叠加。
     """
     T = len(speed_profile_kmh)
     assert len(yaw_rate_rad_s) == T
 
     if use_vertical:
-        vz = float(rng.uniform(vz_range_kmps[0], vz_range_kmps[1]))
+        vz_nominal = float(rng.uniform(vz_range_kmps[0], vz_range_kmps[1]))
     else:
-        vz = 0.0
+        vz_nominal = 0.0
 
     states: List[Tuple[float, float, float, float, float, float]] = []
     x, y, z = float(x0_km), float(y0_km), float(z0_km)
     heading = float(heading0_rad)
 
+    add_proc_noise = bool(enable_process_noise) and (
+        process_pos_std_km > 0.0
+        or process_vel_std_kmps > 0.0
+        or process_vz_std_kmps > 0.0
+    )
+
     for t in range(T):
         v_kmps = float(speed_profile_kmh[t]) / 3600.0
         vx = v_kmps * math.cos(heading)
         vy = v_kmps * math.sin(heading)
+        vz = vz_nominal
+
+        if add_proc_noise:
+            if process_vel_std_kmps > 0.0:
+                vx += float(rng.normal(0.0, process_vel_std_kmps))
+                vy += float(rng.normal(0.0, process_vel_std_kmps))
+            if process_vz_std_kmps > 0.0:
+                vz += float(rng.normal(0.0, process_vz_std_kmps))
+
         states.append((x, y, z, vx, vy, vz))
 
-        # 积分位置
         x += vx * dt_s
         y += vy * dt_s
         z += vz * dt_s
 
-        # 更新 heading（用本步的 yaw_rate）
+        if add_proc_noise and process_pos_std_km > 0.0:
+            x += float(rng.normal(0.0, process_pos_std_km))
+            y += float(rng.normal(0.0, process_pos_std_km))
+            z += float(rng.normal(0.0, process_pos_std_km))
+
         heading = heading + float(yaw_rate_rad_s[t]) * dt_s
 
     return states
@@ -792,16 +947,21 @@ def main() -> None:
                 heading0 = rng_py.uniform(0.0, 2.0 * math.pi)
 
                 # --- 2) 速度曲线 ---
-                speed_profile, n_speed_segments, has_stop = sample_speed_profile_kmh(
-                    NUM_STEPS, rng_np
-                )
+                if traj_type == "stationary":
+                    speed_profile, n_speed_segments, has_stop = (
+                        sample_stationary_speed_profile_kmh(NUM_STEPS, rng_np)
+                    )
+                else:
+                    speed_profile, n_speed_segments, has_stop = (
+                        sample_speed_profile_kmh(NUM_STEPS, rng_np)
+                    )
 
                 # --- 3) yaw-rate 曲线 ---
                 yaw_rate = sample_yaw_rate_profile_rad_s(
                     traj_type, NUM_STEPS, rng_np
                 )
 
-                # --- 4) 积分 ---
+                # --- 4) 积分（可选注入过程噪声）---
                 states = integrate_trajectory(
                     x0_km=x0,
                     y0_km=y0,
@@ -813,6 +973,10 @@ def main() -> None:
                     use_vertical=USE_VERTICAL_MOTION,
                     vz_range_kmps=VERTICAL_VZ_RANGE_KMPS,
                     rng=rng_np,
+                    enable_process_noise=ENABLE_PROCESS_NOISE,
+                    process_pos_std_km=PROCESS_POS_STD_KM,
+                    process_vel_std_kmps=PROCESS_VEL_STD_KMPS,
+                    process_vz_std_kmps=PROCESS_VZ_STD_KMPS,
                 )
 
                 # --- 5) 回填兼容列 ---
@@ -820,7 +984,25 @@ def main() -> None:
                     speed_profile, n_speed_segments, has_stop
                 )
 
+                # --- 6) 量测噪声（仅作用在写出的观测，不累积）---
+                add_meas_noise = ENABLE_MEASUREMENT_NOISE and (
+                    MEAS_POS_STD_KM > 0.0
+                    or MEAS_VEL_STD_KMPS > 0.0
+                    or MEAS_VZ_STD_KMPS > 0.0
+                )
+
                 for step_idx, (x, y, z, vx, vy, vz) in enumerate(states):
+                    if add_meas_noise:
+                        if MEAS_POS_STD_KM > 0.0:
+                            x = x + float(rng_np.normal(0.0, MEAS_POS_STD_KM))
+                            y = y + float(rng_np.normal(0.0, MEAS_POS_STD_KM))
+                            z = z + float(rng_np.normal(0.0, MEAS_POS_STD_KM))
+                        if MEAS_VEL_STD_KMPS > 0.0:
+                            vx = vx + float(rng_np.normal(0.0, MEAS_VEL_STD_KMPS))
+                            vy = vy + float(rng_np.normal(0.0, MEAS_VEL_STD_KMPS))
+                        if MEAS_VZ_STD_KMPS > 0.0:
+                            vz = vz + float(rng_np.normal(0.0, MEAS_VZ_STD_KMPS))
+
                     time_s = step_idx * TIME_STEP
                     writer.writerow(
                         [
@@ -846,6 +1028,12 @@ def main() -> None:
     print(
         f"[generate_trajs] 生成完成：{traj_id} 条轨迹，总 {num_rows} 行。\n"
         f"  每类数量：{per_type_counts}\n"
+        f"  过程噪声: enable={ENABLE_PROCESS_NOISE}, "
+        f"pos_std={PROCESS_POS_STD_KM} km, vel_std={PROCESS_VEL_STD_KMPS} km/s, "
+        f"vz_std={PROCESS_VZ_STD_KMPS} km/s\n"
+        f"  量测噪声: enable={ENABLE_MEASUREMENT_NOISE}, "
+        f"pos_std={MEAS_POS_STD_KM} km, vel_std={MEAS_VEL_STD_KMPS} km/s, "
+        f"vz_std={MEAS_VZ_STD_KMPS} km/s\n"
         f"  输出：{out_path}"
     )
 

@@ -7,8 +7,8 @@ data:
   time_step: 60.0        # 每步时间间隔（秒）
   num_steps: 100         # 每条轨迹步数（可按场景调小到 30~60）
 
-  # ===================== 5 类标签 & 每类样本数 =====================
-  traj_types: ["straight", "left_turn", "right_turn", "s_curve", "u_turn"]
+  # ===================== 6 类标签 & 每类样本数 =====================
+  traj_types: ["straight", "left_turn", "right_turn", "s_curve", "u_turn", "stationary"]
 
   num_traj_per_type:
     straight: 800
@@ -16,6 +16,7 @@ data:
     right_turn: 800
     s_curve: 800
     u_turn: 800
+    stationary: 800
 
   # ===================== 车辆动力学上限 =====================
   speed_range_kmh: [15.0, 60.0]   # 速度采样区间
@@ -62,6 +63,26 @@ data:
     direction: "random"           # "left" / "right" / "random"
     straight_drift_deg_s: 0.0
 
+  stationary:
+    # 近似静止 = "形状真实 + 速度极慢"的混合，模拟低速通过路口 / 泊车机动 /
+    # 排队蠕行等场景。yaw-rate 形状从 sub_types 里随机抽一种正常运动复用，
+    # 速度走专门的极慢区间（不受 min_speed_kmh 影响）。
+    #
+    # 关键 trade-off：
+    #   - 速度太低 → 一步真实位移过小，turn / s_curve 的弯曲半径很小，
+    #     hard-WTA 难以把它和 stationary 分开；
+    #   - 速度太高（>5 km/h）→ 不再"接近静止"。
+    #   折中 [0.5, 2.0] km/h：一步真实位移 ≈ 8–33 m，100 步真位移 ≈ 0.8–3.3 km，
+    #   比其他类小 20–80 倍。当前噪声全关，stationary 是"纯极慢 + 形状缩放"，
+    #   形状靠 sub_types 复用其它类的 yaw-rate 曲线。
+    speed_kmh_range: [0.5, 2.0]    # 基准速度区间（≈ 0.14 ~ 0.55 m/s）
+    speed_jitter_kmh: 0.1          # 步间小抖动 σ
+    full_stop_prob: 0.05           # 极少量纯静止样本（保留多样性，但不要太多否则像噪声团）
+    sub_types: ["straight", "left_turn", "right_turn", "s_curve"]
+    # ↑ 默认 4 种均匀混合；u_turn 已显式排除（低速 180° 掉头不符合现实）。
+    #   想要更纯粹的"近静止"可以缩到 ["straight"]；
+    #   想模拟泊车 S 弯多一点可以改成 ["s_curve"] 之类。
+
   # ===================== 初始位姿 =====================
   init_x_range: [-30.0, 30.0]
   init_y_range: [-30.0, 30.0]
@@ -69,6 +90,31 @@ data:
 
   use_vertical_motion: false
   vertical_vz_range_kmps: [-0.005, 0.005]
+
+  # ===================== 过程噪声 / 量测噪声 =====================
+  # 二者都是零均值高斯，单位与 CSV 一致：位置 km，速度 km/s。
+  #
+  # - 过程噪声（process）：在前向积分时，每一步给状态加扰动。
+  #   pos 噪声直接累加到 x,y,z；vel 噪声让本步实际速度偏离名义速度，
+  #   位置积分会用"被扰动后的速度"，因此速度过程噪声会随时间累积成位置漂移。
+  #   物理含义 ≈ 状态空间模型中 Q 矩阵对角项（未建模动力学扰动）。
+  #
+  # - 量测噪声（measurement）：在写 CSV 之前对每个观测值独立加扰动，不累积。
+  #   物理含义 ≈ 传感器噪声（GPS、IMU、雷达回波等）。
+  noise:
+    # 当前策略：过程噪声 / 量测噪声全关，回到纯净的运动学积分数据。
+    # 用于先排除"噪声引入的 mode collapse"——若关掉噪声后多模态仍然
+    # 训不出来，问题就在 normalize / use_delta / 类别量级不平衡，
+    # 而不是噪声。等多模态学习路径先打通，再考虑分阶段加回噪声。
+    enable_process_noise: false
+    process_pos_std_km: 0.0
+    process_vel_std_kmps: 0.0
+    process_vz_std_kmps: 0.0
+
+    enable_measurement_noise: false
+    measurement_pos_std_km: 0.0
+    measurement_vel_std_kmps: 0.0
+    measurement_vz_std_kmps: 0.0
 
   # ===================== 随机种子 =====================
   random_seed: 42

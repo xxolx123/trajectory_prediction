@@ -23,18 +23,28 @@ eval.py (PyTorch version, MTP + denorm + delta decoding + visualization)
       * 10 步 Pred 未来（best mode）
 
 用法（在项目根目录）：
-    export PYTHONPATH="$PWD/code"
+    export PYTHONPATH="$PWD/code"             # Linux/macOS
+    $env:PYTHONPATH = "$PWD/code"             # Windows PowerShell
 
-    # 显式指定 ckpt
-
-    # 多模态更加明显
-    python -m train.eval --config config.yaml --ckpt checkpoints/20251201163510/best_lstm_epoch001_valloss0.0326.pt --split test
-
-    # 训练 epoch 增加后，多模态不太明显
-    python -m train.eval --config config.yaml --ckpt checkpoints/20251201163510/best_lstm_epoch003_valloss0.0314.pt --split test
-
-    # 或不指定 ckpt，自动从 train.ckpt_dir 里找最新 .pt
+    # ---------- 模式 A：指标评估（默认）----------
+    # 只跑全量指标，不画图。
     python -m train.eval --config config.yaml --split test
+
+    # 显式指定 ckpt：
+    python -m train.eval --config config.yaml --split test \
+        --ckpt checkpoints/20260425222518/best_lstm_epoch048_valloss0.0136.pt
+
+    # ---------- 模式 B：可视化（--vis）----------
+    # 只画图（不算指标），默认 10 张，保存到
+    #   eval_vis/<ckpt_run>__<ckpt_name>/
+    # 例如：eval_vis/20260425222518__best_lstm_epoch048_valloss0.0136/
+    python -m train.eval --config config.yaml --split test --vis
+
+    # 一次画 30 张图：
+    python -m train.eval --config config.yaml --split test --vis --vis-num 30
+
+    # 想要可复现就给 --vis-seed：
+    python -m train.eval --config config.yaml --split test --vis --vis-num 30 --vis-seed 42
 """
 
 import os
@@ -274,6 +284,7 @@ def plot_example_trajectory_multi(
     best_mode: int,
     save_dir: Path,
     title: str = "",
+    save_filename: Optional[str] = None,
 ) -> None:
     """
     画一条样本的多模态轨迹：
@@ -334,7 +345,10 @@ def plot_example_trajectory_multi(
     plt.title(title or "History + GT Future + Multi-modal Pred Futures (XY)")
     plt.axis("equal")
 
-    fname = save_dir / f"eval_traj_example_multi_{int(time.time())}.png"
+    if save_filename:
+        fname = save_dir / save_filename
+    else:
+        fname = save_dir / f"eval_traj_example_multi_{int(time.time())}.png"
     plt.savefig(fname, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"[Info] Saved multi-modal trajectory visualization to: {fname}")
@@ -528,11 +542,19 @@ def plot_random_trajectory(
     split: str,
     device: torch.device,
     save_dir: Path,
+    idx: Optional[int] = None,
+    save_filename: Optional[str] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> None:
     """
-    随机从 eval_ds_py 中抽一个样本，预测并可视化：
+    从 eval_ds_py 中抽一个样本，预测并可视化：
       - 使用 best-of-M 选一个“最佳模式”；
       - 同时把所有 M 条预测轨迹都画出来（best mode 高亮）。
+
+    参数：
+      idx           : 指定样本下标；None 时随机抽
+      save_filename : 指定输出图文件名（不带目录）；None 时按时间戳生成
+      rng           : 随机源；None 时新建（每次 eval 变化）
     """
     data_cfg = cfg.get("data", {})
     in_len = int(data_cfg.get("in_len", 20))
@@ -544,8 +566,10 @@ def plot_random_trajectory(
         print("[Eval] No samples to plot.")
         return
 
-    rng = np.random.default_rng()  # 每次 eval 都变化
-    idx = int(rng.integers(low=0, high=n_samples))
+    if rng is None:
+        rng = np.random.default_rng()  # 每次 eval 都变化
+    if idx is None:
+        idx = int(rng.integers(low=0, high=n_samples))
 
     # eval_ds_py[idx] 是归一化空间的数据（可能是 Δ）
     inputs_norm_np, targets_norm_np = eval_ds_py[idx]   # [Tin,D], [Tout,D]
@@ -612,6 +636,7 @@ def plot_random_trajectory(
         best_mode=m_best,
         save_dir=save_dir,
         title=title,
+        save_filename=save_filename,
     )
 
 
@@ -630,7 +655,20 @@ def pick_split_dataset(split: str, train_ds_py, val_ds_py, test_ds_py):
 
 # ====================== 总评估入口 ======================
 
-def evaluate(config_path: str, ckpt_path: Optional[str] = None, split: str = "test") -> None:
+def evaluate(
+    config_path: str,
+    ckpt_path: Optional[str] = None,
+    split: str = "test",
+    vis: bool = False,
+    vis_num: int = 10,
+    vis_seed: Optional[int] = None,
+) -> None:
+    """
+    两种互斥模式：
+      - vis=False（默认）：只跑全量指标评估（ADE/FDE/RelADE/RelFDE/...），不画图。
+      - vis=True：只画图，跳过指标评估，画 vis_num 张多模态轨迹图，
+                  保存到 eval_vis/<ckpt_run>__<ckpt_name>/ 目录下。
+    """
     project_root = Path(__file__).resolve().parents[2]
 
     cfg_path = Path(config_path)
@@ -696,6 +734,57 @@ def evaluate(config_path: str, ckpt_path: Optional[str] = None, split: str = "te
     state_dict = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state_dict)
 
+    # ====== 模式分流：可视化 / 指标评估 ======
+    if vis:
+        # ----- 可视化模式：画 vis_num 张图，跳过指标 -----
+        ckpt_path_obj = Path(ckpt_path)
+        ckpt_stem = ckpt_path_obj.stem               # e.g. best_lstm_epoch048_valloss0.0136
+        ckpt_run = ckpt_path_obj.parent.name         # e.g. 20260425222518
+        sub_dirname = f"{ckpt_run}__{ckpt_stem}"
+        vis_subdir = (project_root / "eval_vis" / sub_dirname).resolve()
+        vis_subdir.mkdir(parents=True, exist_ok=True)
+
+        n_samples = len(eval_ds_py)
+        if n_samples == 0:
+            print("[Vis] split 为空，无法可视化。")
+            return
+
+        if vis_seed is not None:
+            rng = np.random.default_rng(int(vis_seed))
+        else:
+            rng = np.random.default_rng()
+
+        # 不重复抽样：vis_num <= n_samples 时用 choice(replace=False)
+        if vis_num <= n_samples:
+            sample_indices = rng.choice(n_samples, size=vis_num, replace=False).tolist()
+        else:
+            print(f"[Vis] vis_num={vis_num} 超过 split 大小 {n_samples}，"
+                  f"将采用允许重复抽样。")
+            sample_indices = rng.integers(0, n_samples, size=vis_num).tolist()
+
+        print(f"\n========== Visualization ==========")
+        print(f"Split           = {split}")
+        print(f"Save dir        = {vis_subdir}")
+        print(f"Num samples     = {vis_num}")
+        print(f"Sample indices  = {sample_indices[:20]}{'...' if len(sample_indices) > 20 else ''}")
+        print("===================================\n")
+
+        t_start = time.time()
+        for k, idx in enumerate(sample_indices):
+            fname = f"sample_{k:03d}_idx{int(idx):07d}.png"
+            plot_random_trajectory(
+                model, eval_ds_py, scaler, cfg, split, device,
+                save_dir=vis_subdir,
+                idx=int(idx),
+                save_filename=fname,
+                rng=rng,
+            )
+        elapsed = time.time() - t_start
+        print(f"\n[Info] Visualization done. {vis_num} figures in: {vis_subdir}")
+        print(f"[Info] Elapsed: {elapsed:.1f}s")
+        return
+
+    # ----- 指标评估模式：跑全量指标，不画图 -----
     loss_cfg = TrajLossConfig(return_components=False)
     loss_fn = TrajLoss(loss_cfg)
 
@@ -748,17 +837,20 @@ def evaluate(config_path: str, ckpt_path: Optional[str] = None, split: str = "te
     print(f"Min / Max forward / batch      = "
           f"{min_forward_batch * 1000:.3f} ms / {max_forward_batch * 1000:.3f} ms")
     print("================================\n")
-
-    # ===== 单独随机抽样画一条轨迹 =====
-    vis_dir = project_root / "eval_vis"
-    plot_random_trajectory(model, eval_ds_py, scaler, cfg, split, device, vis_dir)
+    print("[Info] 指标模式：未画图。要可视化请加 --vis （可配 --vis-num N）。")
 
 
 # ====================== CLI 入口 ======================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate multi-modal MTP LSTM trajectory predictor (PyTorch)."
+        description=(
+            "Evaluate multi-modal MTP LSTM trajectory predictor (PyTorch).\n\n"
+            "两种互斥模式：\n"
+            "  默认 (不加 --vis)：只跑全量指标评估（ADE/FDE/RelADE/RelFDE/...）\n"
+            "  --vis             ：只画 vis_num 张可视化图，跳过指标\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config",
@@ -779,8 +871,33 @@ def main():
         choices=["train", "val", "test"],
         help="Which split to evaluate on.",
     )
+    parser.add_argument(
+        "--vis",
+        action="store_true",
+        help="开启可视化模式（只画图、不算指标）。图保存到 "
+             "eval_vis/<ckpt_run>__<ckpt_name>/ 子目录。",
+    )
+    parser.add_argument(
+        "--vis-num",
+        type=int,
+        default=10,
+        help="可视化模式下画几张图（每张随机抽一个不同样本）。默认 10。",
+    )
+    parser.add_argument(
+        "--vis-seed",
+        type=int,
+        default=None,
+        help="可视化抽样的随机种子（不指定则每次结果不同）。",
+    )
     args = parser.parse_args()
-    evaluate(args.config, args.ckpt, args.split)
+    evaluate(
+        args.config,
+        args.ckpt,
+        args.split,
+        vis=args.vis,
+        vis_num=args.vis_num,
+        vis_seed=args.vis_seed,
+    )
 
 
 if __name__ == "__main__":
