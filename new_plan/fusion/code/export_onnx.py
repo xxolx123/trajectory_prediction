@@ -3,15 +3,26 @@ fusion/code/export_onnx.py
 --------------------------
 导出 FullNetV2 为 ONNX。
 
-当前策略：**只暴露 1 个输入 x_raw**；ContextBatch 在模型内用 buffer 零张量，
-导出后的 ONNX 只有一个 3D 输入 [B, hist_len, 6]，和旧部署端
-deploy/.../deploy_3trajs.cpp 期望一致（InferenceEngine 按 3D 输入识别）。
+接口：**7 路独立输入**（与甲方流程图 5 路 + ETA 占位一致）
 
-输出 shape = [B, K, 68]，K 由 gnn1/config.yaml 的 train.keep_top_k 决定（默认 3）。
+  hist_traj    [B, hist_len, 6]      float32   我方观测的历史轨迹（km / km·s⁻¹）
+  task_type    [B]                   int64     敌方作战任务（0=打击）
+  type         [B]                   int64     我方固定目标类型（0/1/2）
+  position     [B, 3]                float32   我方固定目标 xyz（km，局部 ENU）
+  road_points  [B, NB_max, NP_max, 3] float32  路网折线点（km，局部 ENU）
+  road_mask    [B, NB_max, NP_max]   bool      路网点掩码
+  eta          [B]                   int64     我方预计到达时间（秒，占位）
 
-TODO（C++ 侧接入真 ContextBatch 时）：
-  改写 FullNetV2ForOnnx 让 forward 接受多个独立 Tensor（task_type/type/position/
-  road_points/road_mask/own_info），并同步更新 cpp。
+输出：
+  output       [B, K, 68]            float32   K=3，布局见 fusion/README.txt
+
+ENU 原点约定：以 hist_traj 末帧的 LLH 作为局部原点；C++ 部署侧把
+RoadNetwork(LLH) → road_points(km) 之前必须用同一原点。
+
+C++ 部署侧 TODO：
+  - TrajSystem::Feed(...) 需要新增 RoadNetwork road、int64_t eta_sec
+  - InferenceEngine 改成喂 7 输入 ORT session
+  - LLH→ENU 转换可参考 constraint_optimizer/test_road_net/road_schema.py 的 llh_to_enu_km
 """
 
 from __future__ import annotations
@@ -35,43 +46,45 @@ from fusion.code.full_net_v2 import FullNetV2, build_full_net_from_fusion_config
 from fusion.code.build import load_fusion_config  # noqa: E402
 
 
-class FullNetV2ForOnnx(nn.Module):
-    """
-    只暴露 1 个输入 x_raw 给 ONNX；ContextBatch 在模型内部用全零 buffer 构造。
-    """
+# 输入名固定，部署 C++ 侧据此查找 ORT session 的输入张量
+INPUT_NAMES = [
+    "hist_traj",
+    "task_type",
+    "type",
+    "position",
+    "road_points",
+    "road_mask",
+    "eta",
+]
+OUTPUT_NAMES = ["output"]
 
-    def __init__(self, full_net: FullNetV2, ctx_dims: dict) -> None:
+
+class FullNetV2ForOnnx(nn.Module):
+    """把 7 个独立张量打包成 ContextBatch 后喂 FullNetV2。"""
+
+    def __init__(self, full_net: FullNetV2) -> None:
         super().__init__()
         self.full_net = full_net
-        self.ctx_dims = dict(ctx_dims)
 
-        NB_max = int(ctx_dims.get("road_max_branches", 1))
-        NP_max = int(ctx_dims["road_max_points"])
-        D_road = int(ctx_dims["road_point_dim"])
-        D_pos = int(ctx_dims["position_dim"])
-        D_own = int(ctx_dims["own_info_dim"])
-
-        # GNN1 用
-        self.register_buffer("_ctx_task_type", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("_ctx_type", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("_ctx_position", torch.zeros(1, D_pos))
-        # ConstraintOptimizer 用（多分支）
-        self.register_buffer("_ctx_road_points", torch.zeros(1, NB_max, NP_max, D_road))
-        self.register_buffer("_ctx_road_mask", torch.zeros(1, NB_max, NP_max, dtype=torch.bool))
-        # LSTM2 / GNN2 占位
-        self.register_buffer("_ctx_own_info", torch.zeros(1, D_own))
-
-    def forward(self, x_raw: torch.Tensor) -> torch.Tensor:
-        B = x_raw.shape[0]
+    def forward(
+        self,
+        hist_traj: torch.Tensor,    # [B, hist_len, 6]      float32
+        task_type: torch.Tensor,    # [B]                   int64
+        type_id: torch.Tensor,      # [B]                   int64
+        position: torch.Tensor,     # [B, 3]                float32
+        road_points: torch.Tensor,  # [B, NB, NP, 3]        float32
+        road_mask: torch.Tensor,    # [B, NB, NP]           bool
+        eta: torch.Tensor,          # [B]                   int64
+    ) -> torch.Tensor:              # [B, K=3, 68]
         ctx = ContextBatch(
-            task_type=self._ctx_task_type.expand(B).contiguous(),
-            type=self._ctx_type.expand(B).contiguous(),
-            position=self._ctx_position.expand(B, -1).contiguous(),
-            road_points=self._ctx_road_points.expand(B, -1, -1, -1).contiguous(),
-            road_mask=self._ctx_road_mask.expand(B, -1, -1).contiguous(),
-            own_info=self._ctx_own_info.expand(B, -1).contiguous(),
+            task_type=task_type,
+            type=type_id,
+            position=position,
+            road_points=road_points,
+            road_mask=road_mask,
+            eta=eta,
         )
-        return self.full_net(x_raw, ctx)
+        return self.full_net(hist_traj, ctx)
 
 
 def _get_ctx_dims_from_gnn1(fusion_cfg_path: Path) -> dict:
@@ -84,6 +97,33 @@ def _get_ctx_dims_from_gnn1(fusion_cfg_path: Path) -> dict:
     return build_ctx_dims_from_config(gnn1_cfg)
 
 
+def _build_dummy_inputs(
+    full_net: FullNetV2,
+    ctx_dims: dict,
+    device: torch.device,
+    batch_size: int = 1,
+) -> tuple:
+    """构造一组 dummy 张量，用于 torch.onnx.export 的 args。"""
+    B = int(batch_size)
+    hist_len = int(full_net.hist_len)
+    feat_dim = int(full_net.feature_dim)
+
+    NB_max = int(ctx_dims.get("road_max_branches", 1))
+    NP_max = int(ctx_dims["road_max_points"])
+    D_road = int(ctx_dims["road_point_dim"])
+    D_pos = int(ctx_dims["position_dim"])
+
+    hist_traj = torch.zeros(B, hist_len, feat_dim, dtype=torch.float32, device=device)
+    task_type = torch.zeros(B, dtype=torch.long, device=device)
+    type_id = torch.zeros(B, dtype=torch.long, device=device)
+    position = torch.zeros(B, D_pos, dtype=torch.float32, device=device)
+    road_points = torch.zeros(B, NB_max, NP_max, D_road, dtype=torch.float32, device=device)
+    road_mask = torch.zeros(B, NB_max, NP_max, dtype=torch.bool, device=device)
+    eta = torch.zeros(B, dtype=torch.long, device=device)
+
+    return (hist_traj, task_type, type_id, position, road_points, road_mask, eta)
+
+
 def export_onnx(
     fusion_cfg_path: Path,
     onnx_out: Path,
@@ -94,32 +134,37 @@ def export_onnx(
     device = next(full_net.parameters()).device
 
     ctx_dims = _get_ctx_dims_from_gnn1(fusion_cfg_path)
-    model_for_onnx = FullNetV2ForOnnx(full_net, ctx_dims).to(device).eval()
+    model_for_onnx = FullNetV2ForOnnx(full_net).to(device).eval()
 
-    hist_len = full_net.hist_len
-    feature_dim = full_net.feature_dim
+    dummy_inputs = _build_dummy_inputs(full_net, ctx_dims, device, batch_size=1)
 
-    dummy_input = torch.zeros(1, hist_len, feature_dim, dtype=torch.float32, device=device)
+    # 每个输入的 batch 维都开放成 dynamic
+    dynamic_axes = {name: {0: "batch"} for name in INPUT_NAMES}
+    dynamic_axes["output"] = {0: "batch"}
 
     onnx_out.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         model_for_onnx,
-        dummy_input,
+        dummy_inputs,
         onnx_out.as_posix(),
         export_params=True,
         opset_version=opset,
         do_constant_folding=True,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        dynamic_axes=dynamic_axes,
         verbose=False,
         dynamo=False,
     )
-    print(f"[Fusion] ONNX 已导出: {onnx_out}  (output shape = [batch, {full_net.top_k}, 68])")
+    print(
+        f"[Fusion] ONNX 已导出: {onnx_out}\n"
+        f"  inputs  = {INPUT_NAMES}\n"
+        f"  outputs = {OUTPUT_NAMES}  shape = [batch, {full_net.top_k}, 68]"
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export FullNetV2 to ONNX.")
+    parser = argparse.ArgumentParser(description="Export FullNetV2 to ONNX (7-input).")
     parser.add_argument(
         "--fusion-config",
         type=str,

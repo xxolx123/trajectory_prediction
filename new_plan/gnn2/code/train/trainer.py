@@ -22,7 +22,6 @@ for p in (CODE_DIR, REPO_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from common.context_schema import build_ctx_dims_from_config, build_dummy_context  # noqa: E402
 from train.model import build_model_from_config                                    # noqa: E402
 from train.loss import StrikeLoss                                                  # noqa: E402
 
@@ -45,18 +44,19 @@ def run_smoke(cfg: Dict[str, Any]) -> None:
     B = 2
     T = int(m["fut_len"])
     D = int(m["feat_dim"])
-    Df_intent = int(m["intent_feat_dim"])
 
     torch.manual_seed(0)
     pred = torch.randn(B, T, D, device=device)
-    ctx_dims = build_ctx_dims_from_config(cfg)
-    ctx = build_dummy_context(B, device=device, ctx_dims=ctx_dims)
-    intent_feat = torch.randn(B, Df_intent, device=device)
+    eta = torch.tensor([600, 1800], dtype=torch.long, device=device)  # 10 / 30 分钟示例
 
-    out = model(pred, ctx, intent_feat)
+    out = model(pred, eta)
     assert out["strike_pos"].shape == (B, 3), out["strike_pos"].shape
     assert out["strike_radius"].shape == (B, 1), out["strike_radius"].shape
     assert out["strike_conf"].shape == (B, 1), out["strike_conf"].shape
+    # 单位 / 值域校验
+    assert torch.all(out["strike_radius"] >= 0), "strike_radius 必须 >= 0"
+    assert torch.all((out["strike_conf"] >= 0) & (out["strike_conf"] <= 1)), \
+        "strike_conf 必须在 [0, 1]"
     print(
         f"[Smoke/GNN2] forward OK: "
         f"pos {tuple(out['strike_pos'].shape)}, "

@@ -6,27 +6,36 @@ common/context_schema.py
 所有涉及 context 的子网络（gnn1 / gnn2 / constraint_optimizer / fusion）
 都 import 这里的 ContextBatch + build_dummy_context。
 
-字段归属：
+字段归属（与甲方流程图 5 路 + ETA 占位一致）：
+
   GNN1 会用:
-    task_type       [B]        long   敌方作战任务（目前只有 0 = 打击）
-    type            [B]        long   我方固定目标类型 (0/1/2)
-    position        [B, 3]     float  我方固定目标 xyz km（局部 ENU，以 hist 最后一帧为原点）
+    task_type   [B]                 long   敌方作战任务（目前只有 0 = 打击）
+    type        [B]                 long   我方固定目标类型 (0/1/2)
+    position    [B, 3]              float  我方固定目标 xyz km（局部 ENU，
+                                          以 hist 最后一帧为原点）
 
-  ConstraintOptimizer 会用（多分支 v2）:
-    road_points     [B, NB_max, NP_max, 3]  float  每条分支折线点的 xyz km
-    road_mask       [B, NB_max, NP_max]     bool   有效点掩码（按点；某条分支整条无效就把该
-                                                   分支所有 NP 个点全置 False）
+  ConstraintOptimizer 会用:
+    road_points [B, NB_max, NP_max, 3]  float  每条分支折线点的 xyz km
+    road_mask   [B, NB_max, NP_max]     bool   有效点掩码（按点；某条分支整条
+                                              无效就把该分支所有 NP 个点全置 False）
 
-  LSTM2 / GNN2 侧占位:
-    own_info        [B, D_own]  float  我方自身信息（占位，待接入）
+  下游公共占位:
+    eta         [B]                 long   我方预计到达时间（秒，int64 占位；
+                                          flatten_context_for_mlp 里会按 /3600
+                                          归一化到"小时"喂 MLP，避免数值过大）
 
-TODO（等接口定稿）:
-  - 部署端 C++ 侧需要把 RoadPointLLH (lon/lat/alt) → 局部 ENU (km) 后再喂进来
-  - own_info 的维度 / 字段含义待甲方给出
+历史备注:
+  - v1 schema 里曾有 own_info[B, D_own] 占位字段，含义是"我方自身信息"；现在
+    已被语义更明确的 eta 取代（已与业务侧确认）。"我方固定目标"信息由
+    type / position 覆盖，不再由 own_info 表达。
 
-注意:
-  flatten_context_for_mlp 不会把 road_points 拼进去（变长 + mask 不适合 flatten）。
-  GNN2 目前用它构造粗粒度 ctx 向量；需要路网信息的网络应直接索引 ctx.road_points / ctx.road_mask。
+部署侧约定:
+  - C++ 端拿到 RoadNetwork（lon/lat/alt 度+米）后，需先用 hist 末帧 LLH 作为
+    ENU 原点，把每个 RoadPointLLH 转成 km xyz，再填到 road_points / road_mask。
+  - eta 由我方任务系统给，单位秒（int64）。
+
+flatten_context_for_mlp 不会把 road_points 拼进去（变长 + mask 不适合 flatten）。
+GNN2 目前用它构造粗粒度 ctx 向量；需要路网信息的网络应直接索引 ctx.road_points / ctx.road_mask。
 """
 
 from __future__ import annotations
@@ -43,29 +52,31 @@ DEFAULT_CTX_DIMS: Dict[str, Any] = {
     "type_vocab": 3,        # 我方固定目标类型 0..2
     "position_dim": 3,      # xyz km
 
-    # ConstraintOptimizer 相关（多分支 v2）
+    # ConstraintOptimizer 相关（多分支）
     "road_max_branches": 4,   # 每个 batch 最多多少条分支
     "road_max_points": 128,   # 每条分支最多多少个折线点
     "road_point_dim": 3,
 
-    # LSTM2 / GNN2 占位
-    "own_info_dim": 4,
+    # ETA 占位（我方预计到达时间）
+    # ONNX 输入是 int64 秒；flatten_context_for_mlp 里会用 /eta_scale_seconds
+    # 把它归一化成"小时"再喂 MLP（数值更稳定）。
+    "eta_scale_seconds": 3600,
 }
 
 
 @dataclass
 class ContextBatch:
     # ---- GNN1 会用 ----
-    task_type: torch.Tensor       # [B]        long
-    type: torch.Tensor            # [B]        long
-    position: torch.Tensor        # [B, 3]     float
+    task_type: torch.Tensor       # [B]                       long
+    type: torch.Tensor            # [B]                       long
+    position: torch.Tensor        # [B, 3]                    float
 
     # ---- ConstraintOptimizer 会用 ----
-    road_points: torch.Tensor     # [B, NB_max, NP_max, 3]  float
-    road_mask: torch.Tensor       # [B, NB_max, NP_max]     bool
+    road_points: torch.Tensor     # [B, NB_max, NP_max, 3]    float
+    road_mask: torch.Tensor       # [B, NB_max, NP_max]       bool
 
-    # ---- LSTM2 / GNN2 占位 ----
-    own_info: torch.Tensor        # [B, D_own]  float
+    # ---- 占位：我方预计到达时间（秒） ----
+    eta: torch.Tensor             # [B]                       long (int64)
 
     def to(self, device: torch.device) -> "ContextBatch":
         kwargs = {}
@@ -97,7 +108,6 @@ def build_dummy_context(
     NP_max = int(ctx_dims["road_max_points"])
     D_road = int(ctx_dims["road_point_dim"])
     D_pos = int(ctx_dims["position_dim"])
-    D_own = int(ctx_dims["own_info_dim"])
 
     return ContextBatch(
         task_type=torch.zeros(B, device=device, dtype=torch.long),
@@ -105,7 +115,7 @@ def build_dummy_context(
         position=torch.zeros(B, D_pos, device=device, dtype=dtype),
         road_points=torch.zeros(B, NB_max, NP_max, D_road, device=device, dtype=dtype),
         road_mask=torch.zeros(B, NB_max, NP_max, device=device, dtype=torch.bool),
-        own_info=torch.zeros(B, D_own, device=device, dtype=dtype),
+        eta=torch.zeros(B, device=device, dtype=torch.long),
     )
 
 
@@ -126,7 +136,7 @@ def flatten_context_for_mlp(ctx: ContextBatch, ctx_dims: Dict[str, Any]) -> torc
       [task_type_onehot(task_type_vocab),
        type_onehot(type_vocab),
        position(position_dim),
-       own_info(own_info_dim)]
+       eta_hours(1)]                   # = eta(秒) / eta_scale_seconds
 
     road_points / road_mask 不参与 flatten；需要路网信息的网络应直接索引 ctx.road_*。
     """
@@ -136,6 +146,7 @@ def flatten_context_for_mlp(ctx: ContextBatch, ctx_dims: Dict[str, Any]) -> torc
 
     task_vocab = int(ctx_dims["task_type_vocab"])
     type_vocab = int(ctx_dims["type_vocab"])
+    eta_scale = float(ctx_dims.get("eta_scale_seconds", 3600))
 
     task_oh = torch.nn.functional.one_hot(
         ctx.task_type.clamp(min=0, max=task_vocab - 1),
@@ -146,11 +157,13 @@ def flatten_context_for_mlp(ctx: ContextBatch, ctx_dims: Dict[str, Any]) -> torc
         num_classes=type_vocab,
     ).to(dtype=dtype, device=device)
 
+    eta_hours = (ctx.eta.to(dtype=dtype, device=device) / eta_scale).reshape(B, 1)
+
     parts = [
         task_oh,                              # [B, task_type_vocab]
         type_oh,                              # [B, type_vocab]
         ctx.position.reshape(B, -1),          # [B, position_dim]
-        ctx.own_info.reshape(B, -1),          # [B, own_info_dim]
+        eta_hours,                            # [B, 1]
     ]
     return torch.cat(parts, dim=-1)
 
@@ -160,5 +173,5 @@ def flattened_ctx_dim(ctx_dims: Dict[str, Any]) -> int:
         int(ctx_dims["task_type_vocab"])
         + int(ctx_dims["type_vocab"])
         + int(ctx_dims["position_dim"])
-        + int(ctx_dims["own_info_dim"])
+        + 1   # eta_hours scalar
     )

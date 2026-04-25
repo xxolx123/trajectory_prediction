@@ -3,11 +3,19 @@ gnn2/code/train/model.py
 ------------------------
 StrikeZoneGNN：打击区域 + 置信度。
 
-当前实现（占位）：MLP
-    traj flatten + ctx flatten + intent_feat concat → MLP → [B, 5]
-    拆成 pos(3)、softplus(radius)、sigmoid(conf)
+业务接口（与最终需求对齐）::
 
-TODO（真正的 GNN）：见 README.txt。
+    输入:
+      pred_traj  [B, T, 6]   ConstraintOptimizer 输出的"路网约束后预测轨迹"
+                            （fusion 里 B = batch * top_k = batch * 3，三条候选各跑一次）
+      eta        [B]         我方预计到达时间（int64 秒；模型内部归一化为小时）
+
+    输出:
+      strike_pos    [B, 3]   打击区域中心 (x, y, z) km
+      strike_radius [B, 1]   打击半径 km（>= 0，softplus）
+      strike_conf   [B, 1]   置信度 (0..1，sigmoid)
+
+当前实现：MLP 占位（concat → MLP → 5 维）。等打击区域 GT 接入后再换成真正的 GNN。
 """
 
 from __future__ import annotations
@@ -24,31 +32,23 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from common.context_schema import (  # noqa: E402
-    ContextBatch,
-    build_ctx_dims_from_config,
-    flatten_context_for_mlp,
-    flattened_ctx_dim,
-)
-
 
 class StrikeZoneGNN(nn.Module):
     def __init__(
         self,
         fut_len: int,
         feat_dim: int,
-        intent_feat_dim: int,
-        ctx_dims: Dict[str, Any],
+        eta_scale_seconds: float = 3600.0,
         hidden: int = 128,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.fut_len = int(fut_len)
         self.feat_dim = int(feat_dim)
-        self.intent_feat_dim = int(intent_feat_dim)
+        self.eta_scale_seconds = float(eta_scale_seconds)
         self.hidden = int(hidden)
-        self.ctx_dims = dict(ctx_dims)
 
+        # ---- 路网约束后轨迹编码 ----
         traj_in = self.fut_len * self.feat_dim
         self.traj_encoder = nn.Sequential(
             nn.Linear(traj_in, hidden),
@@ -56,59 +56,66 @@ class StrikeZoneGNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
         )
-        ctx_in = flattened_ctx_dim(ctx_dims)
-        self.ctx_encoder = nn.Sequential(
-            nn.Linear(ctx_in, hidden),
+
+        # ---- ETA 编码（标量 → hidden） ----
+        self.eta_encoder = nn.Sequential(
+            nn.Linear(1, hidden // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden // 2, hidden),
         )
-        self.intent_encoder = nn.Sequential(
-            nn.Linear(self.intent_feat_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-        )
+
+        # ---- 融合头 ----
         self.head = nn.Sequential(
-            nn.Linear(hidden * 3, hidden),
+            nn.Linear(hidden * 2, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 5),
+            nn.Linear(hidden, 5),    # 3 (pos) + 1 (radius) + 1 (conf)
         )
 
     def forward(
         self,
-        pred_traj: torch.Tensor,
-        ctx: ContextBatch,
-        intent_feat: torch.Tensor,
+        pred_traj: torch.Tensor,    # [B, T, 6]   km / km·s⁻¹
+        eta: torch.Tensor,          # [B]         long 秒
     ) -> Dict[str, torch.Tensor]:
+        if pred_traj.ndim != 3:
+            raise ValueError(f"pred_traj 形状应为 [B, T, D]，实际 {tuple(pred_traj.shape)}")
         B, T, D = pred_traj.shape
         if T != self.fut_len or D != self.feat_dim:
             raise ValueError(
-                f"pred_traj 形状 [B,T,D]=[{B},{T},{D}] 与配置 [T={self.fut_len},D={self.feat_dim}] 不一致"
+                f"pred_traj 形状 [B,T,D]=[{B},{T},{D}] 与配置 "
+                f"[T={self.fut_len},D={self.feat_dim}] 不一致"
+            )
+        if eta.ndim != 1 or int(eta.shape[0]) != B:
+            raise ValueError(
+                f"eta 形状应为 [B={B}]，实际 {tuple(eta.shape)}"
             )
 
         traj_emb = self.traj_encoder(pred_traj.reshape(B, T * D))
-        ctx_emb = self.ctx_encoder(flatten_context_for_mlp(ctx, self.ctx_dims))
-        intent_emb = self.intent_encoder(intent_feat)
-        merged = torch.cat([traj_emb, ctx_emb, intent_emb], dim=-1)
-        raw = self.head(merged)  # [B, 5]
 
-        pos = raw[:, 0:3]
-        radius = F.softplus(raw[:, 3:4])
-        conf = torch.sigmoid(raw[:, 4:5])
-        return {"strike_pos": pos, "strike_radius": radius, "strike_conf": conf}
+        eta_hours = (eta.to(dtype=pred_traj.dtype) / self.eta_scale_seconds).reshape(B, 1)
+        eta_emb = self.eta_encoder(eta_hours)
+
+        merged = torch.cat([traj_emb, eta_emb], dim=-1)
+        raw = self.head(merged)                                    # [B, 5]
+
+        pos = raw[:, 0:3]                                          # km xyz
+        radius = F.softplus(raw[:, 3:4])                           # km, >=0
+        conf = torch.sigmoid(raw[:, 4:5])                          # [0,1]
+        return {
+            "strike_pos": pos,
+            "strike_radius": radius,
+            "strike_conf": conf,
+        }
 
 
 def build_model_from_config(cfg: Dict[str, Any]) -> StrikeZoneGNN:
     m = cfg.get("model", {})
-    # 用公共 helper 读 context 段，默认值来自 DEFAULT_CTX_DIMS
-    ctx_dims = build_ctx_dims_from_config(cfg)
+    ctx = cfg.get("context", {}) or {}
     return StrikeZoneGNN(
         fut_len=int(m.get("fut_len", 10)),
         feat_dim=int(m.get("feat_dim", 6)),
-        intent_feat_dim=int(m.get("intent_feat_dim", 4)),
-        ctx_dims=ctx_dims,
+        eta_scale_seconds=float(ctx.get("eta_scale_seconds", 3600.0)),
         hidden=int(m.get("hidden_size", 128)),
         dropout=float(m.get("dropout", 0.0)),
     )

@@ -54,16 +54,20 @@ ContextBatch 字段归属
 --------
 common/context_schema.py 里的 ContextBatch 是单一真相源，字段按消费者划分：
 
-  task_type   [B]            long    ──► GNN1
-  type        [B]            long    ──► GNN1     (我方固定目标类型 0..2)
-  position    [B, 3]         float   ──► GNN1     (我方固定目标 xyz km)
-  road_points [B, N_max, 3]  float   ──► ConstraintOptimizer
-  road_mask   [B, N_max]     bool    ──► ConstraintOptimizer
-  own_info    [B, D_own]     float   ──► LSTM2 / GNN2 (占位)
+  task_type   [B]                       long    ──► GNN1   (敌方作战任务，0=打击)
+  type        [B]                       long    ──► GNN1   (我方固定目标类型 0..2)
+  position    [B, 3]                    float   ──► GNN1   (我方固定目标 xyz km)
+  road_points [B, NB_max, NP_max, 3]    float   ──► ConstraintOptimizer
+  road_mask   [B, NB_max, NP_max]       bool    ──► ConstraintOptimizer
+  eta         [B]                       long    ──► GNN2 / 占位 (我方预计到达时间，秒)
 
-路网结构匹配 C++ 侧 RoadNetwork = vector<RoadBranchLLH>；当前 v1 只支持单主干道
-（变长点数 + padding + mask），多分支扩展留 TODO。部署时 lon/lat/alt → 局部 ENU km
-的转换在 C++ 侧做。
+路网结构对齐 C++ 侧 RoadNetwork = vector<RoadBranchLLH>，已升级到多分支
+（[NB_max, NP_max, 3] padding + per-point mask）。部署时 lon/lat/alt → 局部 ENU km
+的转换在 C++ 侧做（参考 constraint_optimizer/test_road_net/road_schema.py 的
+llh_to_enu_km 实现）。
+
+历史备注：v1 schema 里曾有 own_info[B, D_own] 占位字段，含义是"我方自身信息"；
+现已被 eta 取代（GNN1 的 type/position 已覆盖"我方固定目标"信息，不重复）。
 
 
 目录结构（每个子网络一个独立工程 + 一个公共文件夹 + 一个 fusion）
@@ -189,8 +193,13 @@ TODO 全清单（等外部接口 / 数据确定后来补）
 
 与部署端的关系
 --------
-- 现有 deploy/20260120_.../make_so_v6/deploy_3trajs.cpp 不需要改。
-- 导出 ONNX 时 FullNetV2ForOnnx 只暴露 1 个 3D 输入 x_raw，context 在模型内
-  用 buffer 零张量；.cpp 里的 InferenceEngine 按"有且仅有一个 3D 输入"识别
-  成功，has_image_=false，传进去的图像被忽略即可。
-- 以后真 context 接入后，再同步更新 .cpp 与 ONNX 导出包装器。
+- 导出 ONNX 时 FullNetV2ForOnnx 暴露 **7 路独立输入**：
+    hist_traj / task_type / type / position / road_points / road_mask / eta
+  详见 fusion/README.txt 的"ONNX 输入 / 输出（部署契约）"小节。
+- C++ 部署侧（deploy/20260120_.../make_so_v6/deploy_3trajs.cpp）需要配合改造：
+    1) TrajSystem::Feed(...) 增 RoadNetwork road、int64_t eta_sec
+    2) InferenceEngine 改为按 INPUT_NAMES 顺序喂 7 个张量
+    3) RoadNetwork(LLH) → road_points(km) 的转换在 C++ 侧做，原点用 hist 末帧 LLH
+       （参考 constraint_optimizer/test_road_net/road_schema.py 的 llh_to_enu_km）
+- 路网/ETA 暂时拿不到时：road_mask 全 False、对应输入填零，FullNetV2 内部会
+  自动 fallback 等价跳过路网投影。
