@@ -11,11 +11,17 @@ Gnn1Selector：Attention-based 候选轨迹打分器。
 
 输出:
     {
-      "logits":    [B, M],      # 训练 CE 用
-      "probs":     [B, M],      # softmax over M（可选用来诊断）
+      # ===== 对外 / 部署的"主输出"，fusion / deploy / 可视化只看这两个 =====
       "top_idx":   [B, K],      # top-K 候选在 0..M-1 里的索引（按概率降序）
       "top_probs": [B, K],      # 对 top-K 概率重归一化，K 条和 = 1
+
+      # ===== 训练用的中间量；非训练场景请忽略 =====
+      "logits":    [B, M],      # 训练 CE / soft_CE 用
+      "probs":     [B, M],      # softmax over M（可选诊断）
     }
+
+GNN1 的"对外语义" = 只输出 K=3 条候选 + 重归一化概率；
+被 topk 截掉的那 M-K 条候选不会出现在 fusion 输出里，也不应该被可视化。
 
 结构:
     1) 类别 embedding + position MLP → concat → MLP(ctx) → [B, d_emb]

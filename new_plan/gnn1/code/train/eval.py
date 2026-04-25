@@ -142,56 +142,53 @@ def _plot_eval_sample(
     task_type: int,
     type_id: int,
     gt_xy: Optional[np.ndarray],   # [T, 2] or None
-    probs: np.ndarray,             # [M]   GNN1 对 M 条候选的 softmax 概率
+    probs: np.ndarray,             # [M]   仅诊断用，可视化不读
     top_idx: np.ndarray,           # [K]   GNN1 选的 top-K 索引（降序）
     top_probs: np.ndarray,         # [K]   top-K 重归一化概率（和 = 1）
     noise_sigma_km: float,
 ) -> None:
-    M, T, _ = cand_xy.shape
-    top_set = set(int(i) for i in top_idx)
+    """只画 top-K 候选（K = top_idx 长度），被 GNN1 截掉的 M-K 条不画。"""
+    _ = probs  # 故意不读：GNN1 对外只输出 top_idx / top_probs
     top1 = int(top_idx[0])
     correct = (top1 == label)
+    label_in_top = (label in [int(i) for i in top_idx])
 
-    # 1) 候选轨迹
-    for m in range(M):
+    # 候选轨迹：只画 top-K
+    for rank, m_t in enumerate(top_idx):
+        m = int(m_t)
         is_label = (m == label)
-        is_top = (m in top_set)
+        is_top1 = (rank == 0)
         color = _PALETTE[m % len(_PALETTE)]
 
-        if is_top:
-            lw, alpha = 2.4, 1.0
-            z = 3
-        else:
-            lw, alpha = 1.0, 0.45
-            z = 2
+        # 线宽：top1 最粗，其它 top-k 次粗
+        lw = 2.8 if is_top1 else 2.0
         ax.plot(cand_xy[m, :, 0], cand_xy[m, :, 1],
-                color=color, linewidth=lw, alpha=alpha, zorder=z)
+                color=color, linewidth=lw, alpha=1.0, zorder=3)
 
-        # 端点：label = 实心圆；top-k 非 label = 方块；其余 = 三角
+        # 端点：top1 = 五角星；label = 实心圆边框（如果它在 top-K 里）；其余 = 方块
         ex, ey = cand_xy[m, -1, 0], cand_xy[m, -1, 1]
-        if is_label:
-            ax.scatter(ex, ey, s=90, color=color,
+        if is_top1:
+            ax.scatter(ex, ey, s=140, color=color,
+                       edgecolors="black", linewidths=1.4,
+                       marker="*", zorder=6)
+        elif is_label:
+            ax.scatter(ex, ey, s=95, color=color,
                        edgecolors="black", linewidths=1.4,
                        marker="o", zorder=5)
-        elif is_top:
-            ax.scatter(ex, ey, s=60, color=color,
+        else:
+            ax.scatter(ex, ey, s=70, color=color,
                        edgecolors="black", linewidths=1.0,
                        marker="s", zorder=4)
-        else:
-            ax.scatter(ex, ey, s=30, color=color,
-                       marker="^", alpha=0.6, zorder=3)
 
-        # 在端点附近标该候选的 prob，突出 top1
-        prob_txt = f"{probs[m] * 100:.1f}%"
-        if is_top:
-            prob_txt = f"cand{m}: {prob_txt}"
-            if m == top1:
-                prob_txt = f"★{prob_txt}"
-        weight = "bold" if is_top else "normal"
+        # 端点旁边标重归一化概率
+        prob_txt = f"cand{m}: {float(top_probs[rank]) * 100:.1f}%"
+        if is_top1:
+            prob_txt = "★" + prob_txt
+        if is_label:
+            prob_txt += "  (label)"
         ax.annotate(prob_txt, xy=(ex, ey),
                     xytext=(6, 6), textcoords="offset points",
-                    fontsize=7.5, color=color, weight=weight,
-                    alpha=1.0 if is_top else 0.6)
+                    fontsize=8, color=color, weight="bold")
 
     # 2) 原点
     ax.scatter(0, 0, s=55, color="black", marker="*", zorder=6)
@@ -221,7 +218,12 @@ def _plot_eval_sample(
         f"c{int(i)}:{float(p) * 100:.1f}%"
         for i, p in zip(top_idx, top_probs)
     )
-    flag = "OK" if correct else "X"
+    if correct:
+        flag = "OK"
+    elif label_in_top:
+        flag = "miss-top1 (label in top-K)"
+    else:
+        flag = "label NOT in top-K"
     title = (
         f"idx={sample_idx}  task={task_type}  type={type_id}\n"
         f"label={label}  top1={top1} ({flag})  k_seed={k_seed}\n"
