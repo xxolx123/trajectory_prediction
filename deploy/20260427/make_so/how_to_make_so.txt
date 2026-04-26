@@ -1,0 +1,76 @@
+# fusion 部署版 (20260427) —— 编译 lib_lstm_prediction.so
+
+# -----------------------------------------------------------------------------
+# 0) 先把 fusion 的 ONNX 模型转成 MindSpore Lite 的 .ms（在编译机/x86 机离线做）
+# -----------------------------------------------------------------------------
+# 0.1) 在 new_plan/ 下导出 ONNX：
+#        cd new_plan
+#        # Windows PowerShell:  $env:PYTHONPATH = "$PWD"
+#        # Linux/macOS:         export PYTHONPATH="$PWD"
+#        python -m fusion.code.export_onnx \
+#            --fusion-config fusion/config.yaml \
+#            --onnx-out fusion/full_net_v2.onnx
+#
+# 0.2) 用 MindSpore Lite 自带的 converter_lite 转 .ms（输出 full_net_v2.ms）：
+#        export LD_LIBRARY_PATH=/root/mindspore-lite-2.7.0-linux-x64/tools/converter/lib:$LD_LIBRARY_PATH
+#        /root/mindspore-lite-2.7.0-linux-x64/tools/converter/converter/converter_lite \
+#            --fmk=ONNX \
+#            --modelFile=fusion/full_net_v2.onnx \
+#            --outputFile=full_net_v2 \
+#            --saveType=MINDIR
+#      产物：full_net_v2.ms
+#
+# 0.3) 把 full_net_v2.ms 放到部署机上 deploy_cfg.ini 的 model_path 指向的位置；
+#      并保证 deploy_cfg.ini 里的 nb_max / np_max 与导出 / 调用方约定一致。
+
+# -----------------------------------------------------------------------------
+# 1) 目录准备
+# -----------------------------------------------------------------------------
+# 确保项目根目录（make_so/）包含这四个源码文件：
+#   deploy_3trajs.h
+#   deploy_3trajs.cpp
+#   lstm_predict_v1.h
+#   lstm_predict_v1.cpp
+# 注意：fusion 部署版不再依赖 stb_image / OpenCV，源码目录里也不需要 stb_image.h。
+
+# -----------------------------------------------------------------------------
+# 2) 清理并配置构建（仅需传入 MSLITE_ROOT）
+# -----------------------------------------------------------------------------
+rm -rf build
+mkdir -p build && cd build
+
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DMSLITE_ROOT=/root/mindspore-lite-2.7.0-linux-aarch64/runtime
+
+# -----------------------------------------------------------------------------
+# 3) 编译
+# -----------------------------------------------------------------------------
+cmake --build . -j
+
+# -----------------------------------------------------------------------------
+# 4) 产物
+# -----------------------------------------------------------------------------
+# 成功后会生成：
+#   build/lib_lstm_prediction.so
+# CMake 也会按 VERSION/SOVERSION 生成兼容名：
+#   lib_lstm_prediction.so.1.0.0
+#   lib_lstm_prediction.so.1
+# 它们是同一个库不同的 SONAME / 软链接，正常现象。
+
+# -----------------------------------------------------------------------------
+# 5) 运行前检查依赖
+# -----------------------------------------------------------------------------
+ldd lib_lstm_prediction.so
+# 关键依赖应能找到（路径可能不同）：
+#   libmindspore-lite.so => /opt/mindspore-lite-2.7.0-linux-aarch64/runtime/lib/libmindspore-lite.so
+#   libstdc++.so.6 / libm.so.6 / libgcc_s.so.1 / libc.so.6 / libdl.so.2
+# 若 libmindspore-lite.so 未解析到，请设置运行时库路径：
+
+export LD_LIBRARY_PATH=/opt/mindspore-lite-2.7.0-linux-aarch64/runtime/lib:$LD_LIBRARY_PATH
+
+# -----------------------------------------------------------------------------
+# 6) 安装（可选）
+# -----------------------------------------------------------------------------
+# cmake --install . --prefix /你的安装前缀
+#   include/ 安装 deploy_3trajs.h, lstm_predict_v1.h
+#   lib/     安装 lib_lstm_prediction.so 等
