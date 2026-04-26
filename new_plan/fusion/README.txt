@@ -31,6 +31,28 @@ fusion/  —— 把所有子网络拼成 FullNetV2 + 导出 ONNX
    （含义见下方 ContextBatch 字段归属表）。每个输入的 batch 维都开放成 dynamic_axes。
 
 
+模块开关（fusion/config.yaml 的 enable 字段）
+----------
+每个子网络段都有 `enable: true/false`：
+  - lstm1 / gnn1                  必开（流水线主干，关了直接报错）
+  - constraint_optimizer / lstm2 / gnn2   可关；fusion 内部跳过对应步骤，
+                                          [B, K, 68] 中相应位置写哨兵值
+
+哨兵值约定（输出列 → 禁用对应模块时的取值）：
+  0..59   refined traj   constraint_optimizer 关 → LSTM1 物理轨迹（不投影）
+  60      intent_class   lstm2 关 → -1
+  61      threat_prob    lstm2 关 → NaN
+  62..64  strike_pos     gnn2  关 → NaN
+  65      strike_radius  gnn2  关 → NaN
+  66      strike_conf    gnn2  关 → NaN
+  67      mode_prob      始终由 GNN1 输出（永远有效）
+
+ContextBatch 字段缺省：
+  上层只关心已启用模块需要的字段，其它（如 lstm2/gnn2 关闭时只 gnn2 用的 eta）
+  允许直接传 None，fusion 内部 `_normalize_ctx` 会按形状用全零张量补齐。
+  ONNX 导出仍按 7 路独立张量喂入，未受 None 影响。
+
+
 前向流程（简图）
 ----------
   hist_traj
@@ -69,12 +91,13 @@ fusion/  —— 把所有子网络拼成 FullNetV2 + 导出 ONNX
 目录结构
 ----------
   fusion/
-    ├── config.yaml          # 指向各子网络 config / ckpt / scaler 的路径
+    ├── config.yaml          # 指向各子网络 config / ckpt / scaler 的路径，含 enable 开关
     ├── README.txt           # 本文件
     ├── code/
-    │   ├── full_net_v2.py   # 组合模型（top-K + 下游 K 倍 batch-expand）
-    │   ├── build.py         # 构建 FullNetV2（加载各子网络 ckpt + 读 keep_top_k）
-    │   └── export_onnx.py   # 导出 ONNX（内置零 ContextBatch buffer）
+    │   ├── full_net_v2.py   # 组合模型（top-K + 下游 K 倍 batch-expand；按 enable 跳过禁用模块）
+    │   ├── build.py         # 构建 FullNetV2（加载各子网络 ckpt + 解析 enable）
+    │   ├── export_onnx.py   # 导出 ONNX（内置零 ContextBatch buffer）
+    │   └── test_pipeline.py # 端到端测试脚本（按当前 enable 状态串一遍 forward）
     └── checkpoints/         # 可选：组合后二次微调的 ckpt
 
 
@@ -87,32 +110,55 @@ $env:PYTHONPATH = "$PWD"    # Windows PowerShell
 python -m fusion.code.full_net_v2 --smoke
 # → out.shape == [B, 3, 68]
 #   out[..., 67].sum(-1) ≈ 1              （top-3 重归一化校验）
-#   threat_prob / strike_conf ∈ [0, 1]
+#   按当前 enable 状态校验 60..66 列：启用列 ∈ [0,1]，禁用列 = -1 / NaN
 #   eval 下重复 forward 结果一致
 
-# 2) 加载各子网络 ckpt 后导出 ONNX
+# 2) 端到端测试 + 可视化（按当前 enable 状态，用 lstm1/gnn1 真实数据 + 合成路网）
+python -m fusion.code.test_pipeline --n 4 --split test
+# 输出落到 fusion/eval_vis/run_<split>_<stamp>/ ：
+#   inputs.npz             FullNetV2 真正吃下去的张量（hist_traj + 7 路 ctx）
+#   outputs.npz            完整 [B, K, 68] 输出 + 各字段拆解 + 未投影对照
+#   vis_1_history.png       仅 history + GT future + position
+#   vis_2_road.png          仅路网折线（每条样本一张合成 K 叉路网）
+#   vis_3_predictions.png   投影后 top-K 预测 + GT future
+#   vis_4_combined.png      路网 + history + GT + position + 投影后 top-K（全景）
+#   meta.txt               文字摘要（enable / ckpt / 哨兵值校验 / mode_prob）
+
+# 3) 加载各子网络 ckpt 后导出 ONNX
 python -m fusion.code.export_onnx \
     --fusion-config fusion/config.yaml \
     --onnx-out fusion/full_net_v2.onnx
 
 
-fusion/config.yaml 配置各子网络的指向：
-  lstm1:
+fusion/config.yaml 配置各子网络的指向（每段都有 enable 字段）：
+  lstm1:                           # 必开
+    enable: true
     config: "../lstm1/config.yaml"
     ckpt:   "../lstm1/checkpoints/<run_id>/best_lstm_epoch*.pt"
     scaler: "../lstm1/data/processed/scaler_posvel.npz"   # 必填
-  gnn1:
+  gnn1:                            # 必开
+    enable: true
     config: "../gnn1/config.yaml"           # 从里面读 model.top_k 作为 K
     ckpt:   ""                              # 空字符串 = 用随机权重
   constraint_optimizer:
+    enable: true
     config: "../constraint_optimizer/config.yaml"
     ckpt:   ""                              # 当前是 pass_through
-  lstm2:
+  lstm2:                           # 默认 false：占位 MLP 未训练
+    enable: false
     config: "../lstm2/config.yaml"
     ckpt:   ""
-  gnn2:
+  gnn2:                            # 默认 false：占位 MLP 未训练
+    enable: false
     config: "../gnn2/config.yaml"
     ckpt:   ""
+
+  full_net:
+    hist_len: 20
+    fut_len: 10
+    feature_dim: 6
+    use_delta_A: true
+    n_intent_classes: 4    # lstm2 禁用时占位用
 
 
 ONNX 输入 / 输出（部署契约）

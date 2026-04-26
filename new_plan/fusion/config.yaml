@@ -1,26 +1,42 @@
 # =============================================================================
 # fusion 配置：指向各子网络的 config / ckpt / scaler
 # 路径可以是相对本 yaml 的相对路径，也可以是绝对路径
+#
+# enable 字段：
+#   - lstm1 / gnn1 是流水线主干，必须 enable=true（关闭会直接报错）
+#   - constraint_optimizer / lstm2 / gnn2 可选；enable=false 时 fusion 内部跳过，
+#     对应 [B, K, 68] 输出位填哨兵值（intent_class 用 -1，其他字段用 NaN）。
 # =============================================================================
 
+#  ckpt 字段：
+#    - 留空字符串 = 用随机权重
+#    - 指向 .pt 文件 = 直接载入
+#    - 指向目录   = 递归搜 .pt，按修改时间取最新（适合每次重训只更新 run_id 子目录的场景）
 lstm1:
+  enable: true
   config: "../lstm1/config.yaml"
-  ckpt:   ""                                          # 可空（用随机权重）
+  ckpt:   "../lstm1/checkpoints"                      # 自动取目录下最新 .pt
   scaler: "../lstm1/data/processed/scaler_posvel.npz" # 可空（fusion 自动用 mean=0/std=1）
 
 gnn1:
+  enable: true
   config: "../gnn1/config.yaml"
-  ckpt:   ""
+  ckpt:   "../gnn1/checkpoints"                       # 自动取目录下最新 .pt
 
 constraint_optimizer:
+  enable: true
   config: "../constraint_optimizer/config.yaml"
-  ckpt:   ""
+  ckpt:   ""                                          # 当前模块无可学权重
 
+# lstm2 目前是占位 MLP，未训练；默认关闭
 lstm2:
+  enable: false
   config: "../lstm2/config.yaml"
   ckpt:   ""
 
+# gnn2 目前是占位 MLP，未训练；默认关闭
 gnn2:
+  enable: false
   config: "../gnn2/config.yaml"
   ckpt:   ""
 
@@ -34,3 +50,5 @@ full_net:
   fut_len: 10
   feature_dim: 6
   use_delta_A: true
+  # 禁用 lstm2 时占位用的 intent 通道宽度（与 lstm2/config 中 num_intent_classes 对齐）
+  n_intent_classes: 4
