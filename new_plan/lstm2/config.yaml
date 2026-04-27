@@ -72,11 +72,24 @@ data:
   random_seed: 42
 
 model:
-  input_size: 6
-  hidden_size: 128
-  num_layers: 2
-  dropout: 0.0
+  # 三选一：transformer（默认推荐）/ bilstm / lstm
+  type: "transformer"
+
+  # 输入维度由 dataset 端做完工程化后是 11 维（6 原始 + 3 Δ + 1 dist + 1 speed）
+  input_size: 11
+
   num_intent_classes: 4
+
+  # ---- transformer 专用 ----
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  ffn_dim: 256
+  dropout: 0.1
+  max_seq_len: 32        # 给 fut（Tout=10）留余量；将来若改用 hist+fut 也够用
+
+  # ---- bilstm / lstm 专用（type=bilstm/lstm 时才生效；num_layers 共用）----
+  hidden_size: 128
 
 loss:
   lambda_cls: 1.0
@@ -90,5 +103,8 @@ train:
   num_epochs: 10
   lr: 1.0e-3
   weight_decay: 1.0e-5
+  grad_clip: 1.0
   ckpt_dir: "checkpoints"
+  keep_top_k: 3
   log_interval: 100
+  num_workers: 0
