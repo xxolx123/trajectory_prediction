@@ -11,12 +11,12 @@ data:
   traj_types: ["straight", "left_turn", "right_turn", "s_curve", "u_turn", "stationary"]
 
   num_traj_per_type:
-    straight: 800
-    left_turn: 800
-    right_turn: 800
-    s_curve: 800
-    u_turn: 800
-    stationary: 800
+    straight: 2000
+    left_turn: 2000
+    right_turn: 2000
+    s_curve: 2000
+    u_turn: 2000
+    stationary: 500
 
   # ===================== 车辆动力学上限 =====================
   speed_range_kmh: [15.0, 60.0]   # 速度采样区间

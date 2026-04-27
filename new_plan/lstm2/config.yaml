@@ -1,20 +1,75 @@
 # =============================================================================
-# lstm2 配置（骨架；model 段已基本可用，data 段待 generate_trajs 后补齐）
+# lstm2 配置
+#
+# 训练数据通过 code/data/generate_trajs.py 离线生成：
+#   - 复用 gnn1/data/cache/{split}.npz（history + 5 候选 + targets，归一化+delta 空间）
+#   - 复用 gnn1/data/raw/{split}.npz（每个 window 的 task_type / type / position）
+#   - 加载 gnn1/checkpoints 最新 ckpt 跑 top-3 选轨
+#   - 对每个 window 随机抽一种路网拓扑（5 种），过 ConstraintOptimizer 得到精修轨迹
+#   - 用 data.intent_threat 段的硬规则 + 加权威胁度公式生成 (intent_label, threat_score)
+#   - 输出到 lstm2/data/raw/{split}.npz
 # =============================================================================
 
 data:
   raw_dir: "data/raw"
-  output_csv: "synthetic_trajectories.csv"
+  output_csv: "synthetic_trajectories.csv"      # 兼容老字段，目前用不到
   processed_dir: "data/processed"
   scaler_filename: "scaler_intent_posvel.npz"
 
-  # 窗口长度：和历史/未来长度对齐 lstm1
+  # 窗口长度：和 lstm1 对齐
   hist_len: 20
   fut_len: 10
 
   train_ratio: 0.8
   val_ratio: 0.1
   test_ratio: 0.1
+
+  # ---- 数据生成（generate_trajs.py 用） ----
+  # 路径都相对 lstm2/ 根目录
+  gnn1_cache_dir:    "../gnn1/data/cache"
+  gnn1_raw_dir:      "../gnn1/data/raw"
+  gnn1_config:       "../gnn1/config.yaml"
+  gnn1_ckpt:         "../gnn1/checkpoints"      # 目录，自动取最新 .pt
+  lstm1_scaler:      "../lstm1/data/processed/scaler_posvel.npz"
+  constraint_config: "../constraint_optimizer/config.yaml"
+
+  # 路网造假
+  origin_llh: [116.30, 39.90, 0.0]
+  nb_max: 4
+  np_max: 64
+  topology_mix:
+    y_fork:     0.45    # 多分支：真正让 K=3 候选分散
+    t_junction: 0.30    # 主干 + 加长横向支路，让部分候选选横向
+    straight:   0.10
+    curved:     0.10
+    dead_end:   0.05    # 偶尔出 RETREAT 即可
+
+  # 标签阈值（物理空间 km / km/s）
+  # time_step_s 与 lstm1 的 data.time_step 一致；用于把 closing 化成 km/s
+  time_step_s: 60.0
+
+  intent_threat:
+    tau_retreat_dist_km:  1.5      # 远离 ≥ 1.5 km 视为 RETREAT
+    tau_attack_dist_km:   1.5      # 接近 ≥ 1.5 km 才考虑 ATTACK
+    tau_uturn_deg:        120.0    # 总航向变化 ≥ 120° 视为掉头
+    tau_evasion_curv_deg: 8.0      # 平均逐步转角 ≥ 8°/帧 视为 EVASION
+
+    v_min_kmps: 0.0055             # ≈ 20 km/h
+    v_max_kmps: 0.0210             # ≈ 75 km/h
+    closing_max_kmps: 0.020        # 与 v_max 同量级
+    d_max_km: 5.0
+
+    base_attack:  1.0
+    base_evasion: 0.8
+    base_defense: 0.6
+    base_retreat: 0.2
+
+    w_intent:  0.40
+    w_speed:   0.20
+    w_closing: 0.25
+    w_prox:    0.15
+
+  random_seed: 42
 
 model:
   input_size: 6

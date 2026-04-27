@@ -6,19 +6,30 @@ gnn1/code/data/generate_data.py
 为每个 window 生成 samples_per_window 份训练样本。
 
 每条样本字段：
-  candidates: [5, 10, 6]  float32   LSTM1 输出（归一化 + delta 空间）
-  task_type:  ()          int8      敌方作战任务（目前只有 0 = 打击）
-  type:       ()          int8      我方固定目标类型  0..2
-  position:   [3]         float32   我方固定目标 xyz（km），每样本独立
-  label:      ()          int8      5 个候选终点中离 position 最近的索引 k*
-                                    （通常 == k_seed，但噪声大时会翻）
-  soft_label: [5]         float32   (仅当 data.soft_label_tau > 0 时产出)
-                                    soft_k = softmax(-dist_k / tau)
-                                    和 = 1，给训练用软 CE，避免预测 100% 极端
+  candidates:   [5, 10, 6]  float32   LSTM1 输出（归一化 + delta 空间）
+  task_type:    ()          int8      敌方作战任务（目前只有 0 = 打击）
+  type:         ()          int8      我方固定目标类型  0..2
+  position:     [3]         float32   我方固定目标 xyz（km），每样本独立
+  label:        ()          int8      5 个候选终点中离 position 最近的索引 k*
+                                      （通常 == k_seed，但噪声大时会翻）
+  k_seed:       ()          int8      生成 position 时用的"参考候选"索引
+  position_dir: ()          int8      position 采样方向：
+                                       0=forward / 1=backward
+                                       2=side_left / 3=side_right
+  soft_label:   [5]         float32   (仅当 data.soft_label_tau > 0 时产出)
+                                      soft_k = softmax(-dist_k / tau)
+                                      和 = 1，给训练用软 CE，避免预测 100% 极端
 
 坐标系约定：
   - history 所在 window 的"最后一帧位置" 设为原点 (0, 0, 0)；
   - candidates 的端点、position 均是相对于该原点的 km 坐标。
+
+position 4 方向采样（让 GNN1 在 OOD 时也学会输出均匀概率）：
+  - forward    : pos = endpoint_k + ext * step_len * direction         (in-distribution)
+  - backward   : pos = -direction × (|endpoint_k| + ext*step_len)      (OOD)
+  - side_left  : pos = direction(90° CCW) × (|endpoint_k| + ext*step_len)
+  - side_right : pos = direction(90° CW) × (|endpoint_k| + ext*step_len)
+  各方向比例由 data.position_direction_mix 控制。
 
 产出：data/raw/{train,val,test}.npz
 """
@@ -113,6 +124,25 @@ def generate_for_split(
     soft_tau = float(data_cfg.get("soft_label_tau", 0.0))
     save_soft = soft_tau > 0.0
 
+    # ---- position 采样方向混合 ----
+    # 缺省：全 forward（兼容旧行为）
+    dir_mix_cfg = data_cfg.get("position_direction_mix") or {}
+    dir_p = {
+        "forward":    float(dir_mix_cfg.get("forward",    1.0)),
+        "backward":   float(dir_mix_cfg.get("backward",   0.0)),
+        "side_left":  float(dir_mix_cfg.get("side_left",  0.0)),
+        "side_right": float(dir_mix_cfg.get("side_right", 0.0)),
+    }
+    s = sum(dir_p.values())
+    if s <= 0:
+        raise ValueError(f"position_direction_mix 概率和必须 > 0，当前 {dir_mix_cfg}")
+    for k in dir_p:
+        dir_p[k] /= s
+    # 累积概率（4 个方向，最后一个不用）
+    p_fwd = dir_p["forward"]
+    p_fwd_bwd = p_fwd + dir_p["backward"]
+    p_fwd_bwd_sl = p_fwd_bwd + dir_p["side_left"]
+
     # ---- Step A: 对每个 window，一次性解码 5 条候选到 xy ----
     # 把 history 的最后一帧位置作为原点 (0,0)。
     # 注意：由于我们不需要绝对坐标，只需一致的相对坐标即可，直接令 hist_last_xy=(0,0)。
@@ -134,6 +164,8 @@ def generate_for_split(
     out_position = np.empty((n_samples, 3), dtype=np.float32)
     out_label = np.empty(n_samples, dtype=np.int8)
     out_k_seed = np.empty(n_samples, dtype=np.int8)  # 调试用，记录当时用的 k_seed
+    # 0=forward, 1=backward, 2=side_left, 3=side_right
+    out_position_dir = np.empty(n_samples, dtype=np.int8)
     out_soft_label = np.empty((n_samples, M), dtype=np.float32) if save_soft else None
 
     save_targets = targets is not None
@@ -164,9 +196,28 @@ def generate_for_split(
                     step_len = 1.0
             direction = direction / step_len
 
-            # ---- 外推 + 噪声 ----
+            # ---- 方向抽样 + 外推 + 噪声 ----
             ext = float(rng.uniform(ext_lo, ext_hi))
-            pos_xy = ep[k_seed].astype(np.float64) + ext * step_len * direction
+            r_dir = float(rng.random())
+            if r_dir < p_fwd:
+                # forward：保持原行为，pos = endpoint_k 沿候选末端方向外推
+                pos_xy = ep[k_seed].astype(np.float64) + ext * step_len * direction
+                pos_dir_id = 0
+            else:
+                # OOD 三个方向：以 origin 为中心，沿目标方向，距离 = |endpoint_k| + ext*step_len
+                # 这样 4 个方向的 |position| 量级一致；forward 等价于沿原方向到该距离
+                base_dist = float(np.linalg.norm(ep[k_seed]))
+                total_dist = base_dist + ext * step_len
+                if r_dir < p_fwd_bwd:
+                    u_target = -direction
+                    pos_dir_id = 1
+                elif r_dir < p_fwd_bwd_sl:
+                    u_target = np.array([-direction[1], direction[0]])   # 90° CCW
+                    pos_dir_id = 2
+                else:
+                    u_target = np.array([direction[1], -direction[0]])   # 90° CW
+                    pos_dir_id = 3
+                pos_xy = total_dist * u_target
             pos_xy = pos_xy + rng.normal(0.0, sigma_km, size=2)
 
             # ---- label = argmin endpoint 距离 ----
@@ -194,6 +245,7 @@ def generate_for_split(
             out_position[write_idx, 2] = pos_z_default
             out_label[write_idx] = label
             out_k_seed[write_idx] = k_seed
+            out_position_dir[write_idx] = pos_dir_id
             if save_soft:
                 out_soft_label[write_idx] = soft
             if save_targets:
@@ -207,7 +259,8 @@ def generate_for_split(
         "type": out_type,
         "position": out_position,
         "label": out_label,
-        "k_seed": out_k_seed,   # 调试/健康检查用
+        "k_seed": out_k_seed,             # 调试/健康检查用
+        "position_dir": out_position_dir, # 0=fwd, 1=bwd, 2=side_L, 3=side_R
     }
     if save_soft:
         res["soft_label"] = out_soft_label   # [N_samples, M]，训练用
@@ -277,20 +330,50 @@ def main() -> None:
         print(f"       label dist= {dist}")
         print(f"       P(label != k_seed) = {flip_ratio:.3f}   "
               f"(健康范围 0.10 ~ 0.30；>0.5 说明噪声太大，<0.05 说明太小)")
+
+        # position 方向分布
+        if "position_dir" in out:
+            pdir = out["position_dir"]
+            dir_names = {0: "forward", 1: "backward", 2: "side_left", 3: "side_right"}
+            n_total = int(len(pdir))
+            print(f"       position_dir dist:", end="  ")
+            for did, name in dir_names.items():
+                cnt = int((pdir == did).sum())
+                print(f"{name}={cnt / max(1, n_total):.1%}", end="  ")
+            print()
+            # P(label != k_seed) 按方向分组（OOD 应该明显比 forward 高）
+            print("       P(label!=k_seed) by direction:", end="  ")
+            for did, name in dir_names.items():
+                m = (pdir == did)
+                if m.sum() == 0:
+                    continue
+                f = float(np.mean(label[m] != k_seed[m]))
+                print(f"{name}={f:.2f}", end="  ")
+            print()
+
         if "soft_label" in out:
             soft = out["soft_label"].astype(np.float64)
             M = soft.shape[-1]
-            # 平均最大概率（看"赢家"典型多大）
             avg_max = float(soft.max(axis=-1).mean())
-            # 排序后 top-1/2/3 平均概率
-            srt = -np.sort(-soft, axis=-1)   # 降序
-            avg_top = srt.mean(axis=0)       # [M]
-            # 归一化熵 ∈ [0,1]，1 = 均匀
+            srt = -np.sort(-soft, axis=-1)
+            avg_top = srt.mean(axis=0)
             H = -np.sum(soft * np.log(soft + 1e-12), axis=-1)
             H_norm = float((H / np.log(M)).mean())
             top_str = "  ".join(f"top{k + 1}={avg_top[k]:.3f}" for k in range(min(3, M)))
             print(f"       soft_label: avg_max={avg_max:.3f}  H_norm={H_norm:.3f}  "
                   f"({top_str})")
+            # 按方向分组打印 H_norm，OOD 方向应该明显更接近 1
+            if "position_dir" in out:
+                pdir = out["position_dir"]
+                print("       soft_label H_norm by direction:", end="  ")
+                for did, name in {0: "forward", 1: "backward",
+                                  2: "side_left", 3: "side_right"}.items():
+                    m = (pdir == did)
+                    if m.sum() == 0:
+                        continue
+                    H_d = -np.sum(soft[m] * np.log(soft[m] + 1e-12), axis=-1)
+                    print(f"{name}={float(H_d.mean() / np.log(M)):.3f}", end="  ")
+                print()
 
     print("[gen] 完成。")
 

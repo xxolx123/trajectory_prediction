@@ -33,7 +33,23 @@ data:
   #   - tau 越小越接近 hard argmin；越大越平
   #   - 典型距离几 km 时，推荐 0.5 ~ 1.5 km
   #   - 设为 0 = 关闭 soft label，只产 hard label（退回旧行为）
-  soft_label_tau:       1.0
+  # 注意：当前为 OOD-aware 配置（4 方向 position 混合采样），需要 tau ≈ 2.0
+  # 让模型在 OOD（5 条候选距离接近）时学到"输出均匀概率"。tau=1.0 旧行为
+  # 会让模型在 OOD 时仍瞎挑赢家。
+  soft_label_tau:       2.0
+
+  # position 采样方向混合：让 GNN1 训练时不仅见 forward（候选延长线方向）
+  # 还见 backward / side_left / side_right。
+  #   forward    : 与候选延长线同向 = endpoint_k + ext * step_len * direction
+  #   backward   : 与候选延长线反向 = -direction × (|endpoint_k| + ext*step_len)
+  #   side_left  : 候选垂直方向（90° CCW）× (|endpoint_k| + ext*step_len)
+  #   side_right : 候选垂直方向（90° CW）  × (|endpoint_k| + ext*step_len)
+  # 总和必须 = 1.0；若某项为 0 则该方向不采样。
+  position_direction_mix:
+    forward:    0.50
+    backward:   0.20
+    side_left:  0.15
+    side_right: 0.15
 
   random_seed: 42
 
