@@ -8,10 +8,15 @@
 #        # Windows PowerShell:  $env:PYTHONPATH = "$PWD"
 #        # Linux/macOS:         export PYTHONPATH="$PWD"
 #        python -m fusion.code.export_onnx --mode both
-#      产物：
-#        fusion/full_net_v2_no_road.onnx     —— 无路网版（4 路输入；gnn2 启用时 5 路）
-#        fusion/full_net_v2_with_road.onnx   —— 有路网版（6 路输入；gnn2 启用时 7 路）
+#      产物（GNN2 已常驻流水线，两版本都含 eta 输入）：
+#        fusion/full_net_v2_no_road.onnx     —— 无路网版（5 路输入：
+#                                                 hist_traj / task_type / type /
+#                                                 position + eta）
+#        fusion/full_net_v2_with_road.onnx   —— 有路网版（7 路输入：上面 +
+#                                                 road_points / road_mask）
 #      可选：python -m fusion.code._inspect_onnx 查看实际输入名 / dtype / shape
+#      注意：本部署版要求 .ms 必含 eta；如果导出时 fusion.config 关掉了 gnn2，
+#      .ms 会缺 eta 输入，部署侧 InferenceEngine 构造期会直接抛异常。
 #
 # 0.2) 用 MindSpore Lite 自带的 converter_lite 分别转成 .ms：
 #        export LD_LIBRARY_PATH=/root/mindspore-lite-2.7.0-linux-x64/tools/converter/lib:$LD_LIBRARY_PATH

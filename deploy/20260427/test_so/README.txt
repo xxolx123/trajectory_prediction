@@ -13,8 +13,11 @@
 #      - 旧版部署目录中只有单一 full_net_v2.ms 时，可用 model_path= 兜底键
 # 3) deploy_cfg.ini 中的 nb_max / np_max 必须与训练 / 调用方约定一致
 # 4) deploy_cfg.ini 中的 use_road 决定加载哪份 .ms：
-#      use_road=true  → 加载 with_road 版（按 6~7 输入喂；上层传 routes）
-#      use_road=false → 加载 no_road  版（按 4~5 输入喂；上层传的 routes 被忽略）
+#      use_road=true  → 加载 with_road 版（7 输入：hist_traj / task_type / type /
+#                       position + road_points / road_mask + eta；上层传 routes）
+#      use_road=false → 加载 no_road  版（5 输入：hist_traj / task_type / type /
+#                       position + eta；上层传的 routes 被忽略）
+#    GNN2 已经常驻流水线，eta 是必需输入；.ms 不含 eta 会在引擎构造时报错。
 
 # -----------------------------------------------------------------------------
 # 编译（确保已经生成 lib_lstm_prediction.so）
@@ -37,8 +40,8 @@ cd ..
 ./build/run_minimal
 
 # 成功运行会：
-#   1) 在 stdout 打印 [Engine] 一行（model 路径 / has_road / has_eta 能力位）
-#   2) 在 stdout 打印 trace_prob / pred_trace / strike_areas / area_prob
+#   1) 在 stdout 打印 [Engine] 一行（model 路径 / has_road 能力位）
+#   2) 在 stdout 打印 eta_sec used / trace_prob / pred_trace / strike_areas / area_prob
 #   3) 在当前目录写出 trajectories_vis.csv（含 history / prediction / road / target）
 
 # -----------------------------------------------------------------------------

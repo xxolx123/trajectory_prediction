@@ -1,5 +1,9 @@
 // deploy_3trajs.h
-// fusion 部署版（20260427）：与 new_plan/fusion 的 7 输入 ONNX/.ms 模型对齐。
+// fusion 部署版（20260427）：与 new_plan/fusion 的双模式 ONNX/.ms 模型对齐。
+//   no_road  版：5 输入  hist_traj / task_type / type / position / eta
+//   with_road版：7 输入  上面 + road_points / road_mask
+//   两版按 deploy_cfg.ini 的 use_road 切换；eta 是 GNN2 必需输入，本部署版假设
+//   GNN2 始终启用，.ms 不含 eta 会在引擎构造期报错。
 // 主要差异（相对 20260120 旧版）：
 //   1) LocData_loc 新增 task_type / our_type / target_lon/lat/alt_m / eta_sec，
 //      库内只取 buffer_ 末帧的元信息喂模型；
@@ -105,8 +109,8 @@ public:
     // 满 20 分钟返回 true；否则 false
     //   pred_trace[m]   ：第 m 条候选未来 10 步（含末步的 intent / threat 写在 Type/Threat 字段）
     //   trace_prob      ：mode_prob（gnn1 重归一化，K 条和=1）
-    //   strike_areas[m] ：{lon, lat, z_km, radius_km}，gnn2 关时全 0
-    //   area_prob[m]    ：strike_conf；gnn2 关时为 0
+    //   strike_areas[m] ：{lon, lat, z_km, radius_km}（若 fusion 输出 NaN 兜底全 0）
+    //   area_prob[m]    ：strike_conf ∈ [0, 1]（若 fusion 输出 NaN 兜底 0）
     bool Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
                std::vector<double>& trace_prob,
                std::map<int, std::vector<double>>& strike_areas,

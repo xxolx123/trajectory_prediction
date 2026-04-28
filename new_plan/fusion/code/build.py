@@ -307,7 +307,7 @@ def build_subnetworks(
     # 注入为 True，让 gnn2 工厂返回 manual 版。训练侧 gnn2/config.yaml 不受影响。
     gnn2_sec_for_manual = fusion_cfg.get("gnn2", {}) or {}
     if (
-        _is_enabled(gnn2_sec_for_manual, default=False)
+        _is_enabled(gnn2_sec_for_manual, default=True)
         and bool(gnn2_sec_for_manual.get("manual_attention", False))
     ):
         def _build_gnn2_manual(sub_cfg: Dict[str, Any]) -> torch.nn.Module:

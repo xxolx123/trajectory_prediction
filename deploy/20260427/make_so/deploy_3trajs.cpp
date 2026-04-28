@@ -5,14 +5,13 @@
 // 主要差异（相对 20260120 旧版）：
 //   1) LocData_route 从 PNG 图像 改为 LLH 折线，部署侧用 hist 末帧 LLH
 //      作为局部 ENU 原点做 LLH→km 转换，再按 nb_max/np_max 打包 + mask；
-//   2) fusion 模型改为按 ONNX **输入名字**动态绑定 MSTensor，可同时兼容：
-//        no_road  版（4 输入：hist_traj / task_type / type / position）
-//        no_road  版（5 输入，gnn2 启用时：上面 + eta）
-//        with_road版（6 输入：上面 + road_points / road_mask）
-//        with_road版（7 输入，gnn2 启用时：上面 + road_points / road_mask + eta）
+//   2) fusion 模型改为按 ONNX **输入名字**动态绑定 MSTensor，仅支持两种 .ms：
+//        no_road  版：5 输入  hist_traj / task_type / type / position / eta
+//        with_road版：7 输入  上面 + road_points / road_mask
+//      eta 是 GNN2 必需输入，本部署版假设 GNN2 始终启用；.ms 不含 eta 则在
+//      引擎构造期直接抛异常，不再静默回退到"无 eta"分支。
 //      具体加载哪份由 deploy_cfg.ini 的 use_road 开关决定；上层传来的 routes
-//      在 use_road=false 时会被忽略；ONNX 实际有/无 eta 由 fusion 端 gnn2.enable
-//      决定（导出时 export_onnx.py 自动调整），部署侧动态适配，不需要重编 .so；
+//      在 use_road=false 时会被忽略；
 //   3) 速度严格按 ENU 映射：vx=Speed_east, vy=Speed_north, vz=Speed_tianxiang，
 //      与 fusion 训练数据轴序一致；
 //   4) lstm2/gnn2 输出位（intent_class / threat_prob / strike_*）若为 NaN/-1，
@@ -273,10 +272,11 @@ static void pack_road_to_tensors(const LocData_route& road,
 
 // ============================================================================
 // MindSpore Lite 推理引擎：按输入名字动态绑定 MSTensor
-//   必需输入（4 路）：hist_traj / task_type / type / position
-//   可选输入：road_points + road_mask（成对，with_road 版才有）
-//             eta（gnn2.enable=true 时才有）
-// 不再硬编码 7 路，构造时按 ONNX 实际输入清单决定 has_road_inputs_/has_eta_input_。
+//   必需输入（5 路）：hist_traj / task_type / type / position / eta
+//   可选输入：road_points + road_mask（成对，with_road 版才有；no_road 版没有）
+//
+// GNN2 已经常驻流水线，eta 是必需输入；.ms 缺 eta 直接抛异常，不再静默回退。
+// has_road_inputs_ 仍按 ONNX 实际清单运行时探测，对应 use_road 双 .ms 切换。
 // ============================================================================
 class TrajSystem::InferenceEngine {
 public:
@@ -297,18 +297,21 @@ public:
             name2idx_[inputs[i].Name()] = static_cast<int>(i);
         }
 
-        // 必需输入：缺一个就报错（同时把 .ms 实际清单打出来辅助排查）
-        for (const char* n : {IN_NAME_HIST, IN_NAME_TASK, IN_NAME_TYPE, IN_NAME_POS}) {
+        // 必需输入（含 eta）：缺一个就报错，同时把 .ms 实际清单打出来辅助排查
+        for (const char* n : {IN_NAME_HIST, IN_NAME_TASK, IN_NAME_TYPE, IN_NAME_POS,
+                               IN_NAME_ETA}) {
             if (name2idx_.find(n) == name2idx_.end()) {
                 std::ostringstream oss;
                 oss << "Cannot find required input tensor by name: " << n
                     << ". Available inputs:";
                 for (const auto& kv : name2idx_) oss << " '" << kv.first << "'";
+                oss << ". 本部署版要求 GNN2 已开启 (.ms 必含 eta)，"
+                       "请用 fusion/code/export_onnx.py（gnn2.enable=true）重新导出。";
                 throw std::runtime_error(oss.str());
             }
         }
 
-        // 可选输入：按 ONNX 实际有无来设置能力位
+        // 可选输入：road_points / road_mask 必须成对，缺其一报错
         const bool has_rpts  = name2idx_.count(IN_NAME_RPTS)  > 0;
         const bool has_rmask = name2idx_.count(IN_NAME_RMASK) > 0;
         if (has_rpts != has_rmask) {
@@ -317,15 +320,13 @@ public:
                 "但当前 .ms 只含其中一个");
         }
         has_road_inputs_ = has_rpts && has_rmask;
-        has_eta_input_   = name2idx_.count(IN_NAME_ETA) > 0;
 
         std::cerr << "[Engine] model=" << model_path
                   << "  inputs=" << inputs.size()
                   << "  has_road=" << (has_road_inputs_ ? "true" : "false")
-                  << "  has_eta="  << (has_eta_input_   ? "true" : "false")
                   << "\n";
 
-        // Resize 一次：batch=1；只对存在的输入设新形状
+        // Resize 一次：batch=1
         std::vector<std::vector<int64_t>> new_shapes(inputs.size());
         for (size_t i = 0; i < inputs.size(); ++i) {
             new_shapes[i] = inputs[i].Shape();   // 默认沿用模型自带的形状
@@ -334,12 +335,10 @@ public:
         new_shapes[name2idx_[IN_NAME_TASK]] = {1};
         new_shapes[name2idx_[IN_NAME_TYPE]] = {1};
         new_shapes[name2idx_[IN_NAME_POS]]  = {1, 3};
+        new_shapes[name2idx_[IN_NAME_ETA]]  = {1};
         if (has_road_inputs_) {
             new_shapes[name2idx_[IN_NAME_RPTS]]  = {1, nb_max_, np_max_, 3};
             new_shapes[name2idx_[IN_NAME_RMASK]] = {1, nb_max_, np_max_};
-        }
-        if (has_eta_input_) {
-            new_shapes[name2idx_[IN_NAME_ETA]] = {1};
         }
 
         if (model_.Resize(inputs, new_shapes) != mindspore::kSuccess) {
@@ -347,15 +346,16 @@ public:
         }
     }
 
-    // 输入按引擎能力位分支：has_road_inputs_=false 时 road_points/road_mask 被忽略；
-    // has_eta_input_=false 时 eta 被忽略。output 至少有 1 个，且第一个为 [1,K,68] float32。
+    // hist / task_type / type / position / eta 必传；road_points / road_mask 仅
+    // has_road_inputs_=true（with_road .ms）时使用，no_road 下传空 vector 即可。
+    // output 至少有 1 个，且第一个为 [1,K,68] float32。
     std::vector<float> forward(const std::vector<float>&    hist,         // [1*20*6]
                                const std::vector<int64_t>&  task_type,    // [1]
                                const std::vector<int64_t>&  type_id,      // [1]
                                const std::vector<float>&    position,     // [1*3]
-                               const std::vector<float>&    road_points,  // [1*NB*NP*3]，可空
-                               const std::vector<uint8_t>&  road_mask,    // [1*NB*NP]，可空
-                               const std::vector<int64_t>&  eta)          // [1]，可空
+                               const std::vector<float>&    road_points,  // [1*NB*NP*3]，no_road 时可空
+                               const std::vector<uint8_t>&  road_mask,    // [1*NB*NP]，no_road 时可空
+                               const std::vector<int64_t>&  eta)          // [1]，必传
     {
         auto inputs = model_.GetInputs();
 
@@ -389,12 +389,10 @@ public:
         cpy_i64 (IN_NAME_TASK,  task_type);
         cpy_i64 (IN_NAME_TYPE,  type_id);
         cpy_f32 (IN_NAME_POS,   position);
+        cpy_i64 (IN_NAME_ETA,   eta);
         if (has_road_inputs_) {
             cpy_f32 (IN_NAME_RPTS,  road_points);
             cpy_bool(IN_NAME_RMASK, road_mask);
-        }
-        if (has_eta_input_) {
-            cpy_i64(IN_NAME_ETA, eta);
         }
 
         std::vector<mindspore::MSTensor> outputs;
@@ -411,7 +409,6 @@ public:
     int  nb_max()           const { return nb_max_; }
     int  np_max()           const { return np_max_; }
     bool has_road_inputs()  const { return has_road_inputs_; }
-    bool has_eta_input()    const { return has_eta_input_; }
 
 private:
     mindspore::Model                       model_;
@@ -419,7 +416,6 @@ private:
     int                                    nb_max_           = 4;
     int                                    np_max_           = 128;
     bool                                   has_road_inputs_  = false;
-    bool                                   has_eta_input_    = false;
 };
 
 // ============================================================================
@@ -554,11 +550,8 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
     std::vector<int64_t> task_buf{ static_cast<int64_t>(task_type) };
     std::vector<int64_t> type_buf{ static_cast<int64_t>(our_type) };
 
-    // eta 仅在 .ms 含 eta 输入时构造；否则空 vector，forward 内部会跳过 memcpy
-    std::vector<int64_t> eta_buf;
-    if (engine_->has_eta_input()) {
-        eta_buf.push_back(eta_sec);
-    }
+    // eta 是 GNN2 必需输入（.ms 不含 eta 已在 InferenceEngine 构造期报错）
+    std::vector<int64_t> eta_buf{ static_cast<int64_t>(eta_sec) };
 
     std::vector<float> pos_buf(3, 0.0f);
     {
@@ -684,7 +677,9 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
             aoi[2] = static_cast<double>(sp_z);          // z 仍用 km，便于上层
             aoi[3] = finite_f(radius) ? static_cast<double>(radius) : 0.0;
         } else {
-            aoi.assign(4, 0.0);  // gnn2 关 → 哨兵值 NaN → 全 0
+            // GNN2 现已常驻流水线，正常推理不会到这分支；仅用于兜底数值异常
+            // （若 fusion 仍出现 NaN 哨兵，等价于上层"无打击区域"语义）
+            aoi.assign(4, 0.0);
         }
         strike_areas[m] = std::move(aoi);
 

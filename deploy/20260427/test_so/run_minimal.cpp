@@ -95,6 +95,9 @@ int main() {
         }
 
         // ---- 4) 打印 ----
+        // eta 是 GNN2 必需输入；这里打印末帧的 eta_sec，方便部署侧第一次连接新 .ms
+        // 时一眼确认 eta 实际进了模型
+        std::cout << "eta_sec used = " << locs.back().eta_sec << " s\n";
         std::cout << "trace_prob:";
         for (double p : trace_prob) std::cout << " " << p;
         std::cout << "\n";
