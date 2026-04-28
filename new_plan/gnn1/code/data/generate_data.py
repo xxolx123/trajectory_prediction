@@ -32,6 +32,21 @@ position 4 方向采样（让 GNN1 在 OOD 时也学会输出均匀概率）：
   各方向比例由 data.position_direction_mix 控制。
 
 产出：data/raw/{train,val,test}.npz
+
+用法（在 new_plan/gnn1/ 下）：
+    # Windows PowerShell
+    $env:PYTHONPATH = "$PWD/code"
+    # Linux/macOS
+    # export PYTHONPATH="$PWD/code"
+
+    # 默认读 config.yaml，全量生成 train/val/test：
+    python -m data.generate_data --config config.yaml
+
+    # 只生成指定 split：
+    python -m data.generate_data --config config.yaml --splits val
+    python -m data.generate_data --config config.yaml --splits train val test
+
+    前置：先跑 cache_lstm1_preds.py 生成 data/cache/{split}.npz 与 scaler_posvel.npz。
 """
 
 from __future__ import annotations

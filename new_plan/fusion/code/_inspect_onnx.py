@@ -1,4 +1,16 @@
-"""一次性 inspect ONNX 元数据：opset、输入名/形状/dtype、输出形状、节点总数。"""
+"""一次性 inspect ONNX 元数据：opset、输入名/形状/dtype、输出形状、节点总数。
+
+读取 ``fusion/full_net_v2_no_road.onnx`` 与 ``fusion/full_net_v2_with_road.onnx``
+（路径相对仓库根硬编码），不存在的文件自动跳过。
+
+用法（在 new_plan/ 下）::
+
+    cd new_plan
+    $env:PYTHONPATH = "$PWD"
+    python -m fusion.code._inspect_onnx
+
+前置：先跑 ``python -m fusion.code.export_onnx`` 把两份 ONNX 导到 fusion/ 目录。
+"""
 import os
 import sys
 from pathlib import Path

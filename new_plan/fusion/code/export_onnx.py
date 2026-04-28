@@ -62,6 +62,27 @@ C++ 部署侧 TODO
 - 接外部 bool flag → 选 ``full_net_v2_no_road.onnx`` 或 ``full_net_v2_with_road.onnx``
 - 拿不到路网时：直接加载 no_road 版，喂 5 个输入即可
 - 拿到路网时：加载 with_road 版，按 7 输入约定准备张量
+
+用法（在 new_plan/ 下激活 LSTM_traj_predict 环境后）::
+
+    cd new_plan
+    $env:PYTHONPATH = "$PWD"
+
+    # 默认：同时导出 no_road + with_road 两份 ONNX 到 fusion/ 目录
+    python -m fusion.code.export_onnx
+
+    # 只导其中一份：
+    python -m fusion.code.export_onnx --mode no_road
+    python -m fusion.code.export_onnx --mode with_road
+
+    # 显式指定 fusion config / 输出目录 / opset：
+    python -m fusion.code.export_onnx \
+        --fusion-config fusion/config.yaml \
+        --out-dir fusion \
+        --mode both \
+        --opset 11
+
+输出文件名固定为 ``full_net_v2_no_road.onnx`` / ``full_net_v2_with_road.onnx``。
 """
 
 from __future__ import annotations

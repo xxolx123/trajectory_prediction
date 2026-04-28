@@ -2,6 +2,14 @@
 gnn2/code/data/generate_data.py
 -------------------------------
 TODO: 等接口 + 打击区域 GT 标签定型后实现。
+
+用法（在 new_plan/gnn2/ 下，目前仅占位，跑起来会抛 NotImplementedError）：
+    # Windows PowerShell
+    $env:PYTHONPATH = "$PWD/code"
+    # Linux/macOS
+    # export PYTHONPATH="$PWD/code"
+
+    python -m data.generate_data --config config.yaml
 """
 
 from __future__ import annotations

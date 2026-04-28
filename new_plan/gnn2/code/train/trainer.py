@@ -2,6 +2,18 @@
 gnn2/code/train/trainer.py
 --------------------------
 GNN2 训练主入口（骨架 + --smoke）。
+
+用法（在 new_plan/gnn2/ 下）：
+    # Windows PowerShell
+    $env:PYTHONPATH = "$PWD/code"
+    # Linux/macOS
+    # export PYTHONPATH="$PWD/code"
+
+    # 冒烟测试（不依赖任何数据，构造随机输入跑一遍 forward + 占位 loss）
+    python -m train.trainer --smoke
+
+    # 正式训练（目前打击区域 GT 还没定型，跑会抛 NotImplementedError）
+    python -m train.trainer --config config.yaml
 """
 
 from __future__ import annotations
