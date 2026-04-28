@@ -3,25 +3,36 @@
 # -----------------------------------------------------------------------------
 # 0) 先把 fusion 的 ONNX 模型转成 MindSpore Lite 的 .ms（在编译机/x86 机离线做）
 # -----------------------------------------------------------------------------
-# 0.1) 在 new_plan/ 下导出 ONNX：
+# 0.1) 在 new_plan/ 下导出 ONNX（双模式，默认 opset=11）：
 #        cd new_plan
 #        # Windows PowerShell:  $env:PYTHONPATH = "$PWD"
 #        # Linux/macOS:         export PYTHONPATH="$PWD"
-#        python -m fusion.code.export_onnx \
-#            --fusion-config fusion/config.yaml \
-#            --onnx-out fusion/full_net_v2.onnx
+#        python -m fusion.code.export_onnx --mode both
+#      产物：
+#        fusion/full_net_v2_no_road.onnx     —— 无路网版（4 路输入；gnn2 启用时 5 路）
+#        fusion/full_net_v2_with_road.onnx   —— 有路网版（6 路输入；gnn2 启用时 7 路）
+#      可选：python -m fusion.code._inspect_onnx 查看实际输入名 / dtype / shape
 #
-# 0.2) 用 MindSpore Lite 自带的 converter_lite 转 .ms（输出 full_net_v2.ms）：
+# 0.2) 用 MindSpore Lite 自带的 converter_lite 分别转成 .ms：
 #        export LD_LIBRARY_PATH=/root/mindspore-lite-2.7.0-linux-x64/tools/converter/lib:$LD_LIBRARY_PATH
-#        /root/mindspore-lite-2.7.0-linux-x64/tools/converter/converter/converter_lite \
-#            --fmk=ONNX \
-#            --modelFile=fusion/full_net_v2.onnx \
-#            --outputFile=full_net_v2 \
-#            --saveType=MINDIR
-#      产物：full_net_v2.ms
+#        CONV=/root/mindspore-lite-2.7.0-linux-x64/tools/converter/converter/converter_lite
 #
-# 0.3) 把 full_net_v2.ms 放到部署机上 deploy_cfg.ini 的 model_path 指向的位置；
-#      并保证 deploy_cfg.ini 里的 nb_max / np_max 与导出 / 调用方约定一致。
+#        $CONV --fmk=ONNX \
+#              --modelFile=fusion/full_net_v2_no_road.onnx \
+#              --outputFile=full_net_v2_no_road \
+#              --saveType=MINDIR
+#
+#        $CONV --fmk=ONNX \
+#              --modelFile=fusion/full_net_v2_with_road.onnx \
+#              --outputFile=full_net_v2_with_road \
+#              --saveType=MINDIR
+#      产物：full_net_v2_no_road.ms / full_net_v2_with_road.ms
+#
+# 0.3) 把两份 .ms 放到部署机上 deploy_cfg.ini 的 model_path_with_road /
+#      model_path_no_road 指向的位置；并保证 deploy_cfg.ini 里的 nb_max / np_max
+#      与导出 / 调用方约定一致。
+#      只用其中一种模式时也可只放对应那份；缺失另一份不会影响（除非 use_road
+#      指向了它）。
 
 # -----------------------------------------------------------------------------
 # 1) 目录准备
@@ -56,6 +67,9 @@ cmake --build . -j
 #   lib_lstm_prediction.so.1.0.0
 #   lib_lstm_prediction.so.1
 # 它们是同一个库不同的 SONAME / 软链接，正常现象。
+#
+# 该 .so 同时支持 with_road / no_road 双模式，运行时由 deploy_cfg.ini 的
+# use_road 字段决定加载哪份 .ms；切换模式无需重编 .so。
 
 # -----------------------------------------------------------------------------
 # 5) 运行前检查依赖

@@ -3,6 +3,11 @@
 //   1) 构造 20 条 LLH 观测（每条 60s 间隔）+ 路网折线 + 目标 / ETA
 //   2) 调 LSTM_predict 拿四元组（pred_trace / trace_prob / strike_areas / area_prob）
 //   3) 打印结果 + 写 trajectories_vis.csv（含 history / prediction / road / target 四类）
+//
+// 路网模式由 deploy_cfg.ini 的 use_road 字段控制：
+//   use_road=true  → 加载 with_road .ms，使用本测试构造的 routes
+//   use_road=false → 加载 no_road  .ms，本测试构造的 routes 会被库内忽略
+// 切换该开关无需重新编译，本测试源文件保持不变。
 
 #include "lstm_predict_v1.h"
 

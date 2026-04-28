@@ -1,17 +1,21 @@
 // deploy_3trajs.cpp
-// fusion 部署版（20260427）：与 new_plan/fusion 的 7 输入 ONNX/.ms 模型对齐。
+// fusion 部署版（20260427）：与 new_plan/fusion 的双模式 ONNX/.ms 模型对齐。
 // 上层调用 LSTM_predict(locs, routes, instant_ms) 主签名不变。
 //
 // 主要差异（相对 20260120 旧版）：
 //   1) LocData_route 从 PNG 图像 改为 LLH 折线，部署侧用 hist 末帧 LLH
 //      作为局部 ENU 原点做 LLH→km 转换，再按 nb_max/np_max 打包 + mask；
-//   2) LSTM1+GNN1+ConstraintOptimizer+(LSTM2)+(GNN2) 的 fusion 模型改为
-//      7 输入：hist_traj / task_type / type / position / road_points / road_mask / eta；
-//   3) MindSpore Lite InferenceEngine 改为按输入 **名字** 绑定 MSTensor，
-//      不再按 rank 区分轨迹/图像；
-//   4) 速度严格按 ENU 映射：vx=Speed_east, vy=Speed_north, vz=Speed_tianxiang，
+//   2) fusion 模型改为按 ONNX **输入名字**动态绑定 MSTensor，可同时兼容：
+//        no_road  版（4 输入：hist_traj / task_type / type / position）
+//        no_road  版（5 输入，gnn2 启用时：上面 + eta）
+//        with_road版（6 输入：上面 + road_points / road_mask）
+//        with_road版（7 输入，gnn2 启用时：上面 + road_points / road_mask + eta）
+//      具体加载哪份由 deploy_cfg.ini 的 use_road 开关决定；上层传来的 routes
+//      在 use_road=false 时会被忽略；ONNX 实际有/无 eta 由 fusion 端 gnn2.enable
+//      决定（导出时 export_onnx.py 自动调整），部署侧动态适配，不需要重编 .so；
+//   3) 速度严格按 ENU 映射：vx=Speed_east, vy=Speed_north, vz=Speed_tianxiang，
 //      与 fusion 训练数据轴序一致；
-//   5) lstm2/gnn2 输出位（intent_class / threat_prob / strike_*）若为 NaN/-1，
+//   4) lstm2/gnn2 输出位（intent_class / threat_prob / strike_*）若为 NaN/-1，
 //      回退为 0，避免下游拿到非数。
 
 #include "deploy_3trajs.h"
@@ -71,9 +75,21 @@ static const double EARTH_R_KM = 6371.0;
 // 配置文件 (deploy_cfg.ini)
 // ============================================================================
 struct DeployCfg {
-    std::string model_path = "./full_net_v2.ms";
-    int         nb_max     = 4;
-    int         np_max     = 128;
+    // ---- 路网模式开关 ----
+    // true  → 加载 with_road .ms（上层传的 routes 会被使用）
+    // false → 加载 no_road  .ms（routes 被忽略）
+    bool        use_road              = true;
+
+    // 双模式 .ms 路径；任一未在 cfg 中显式给出（保持空）则回退到 model_path
+    // 这样旧版只配 model_path= 的 deploy_cfg.ini 仍能向后兼容
+    std::string model_path_with_road  = "";
+    std::string model_path_no_road    = "";
+
+    // 旧版兼容兜底；空表示用上面两个新键
+    std::string model_path            = "";
+
+    int         nb_max                = 4;
+    int         np_max                = 128;
 
     int     default_task_type    = 0;
     int     default_our_type     = 0;
@@ -99,6 +115,19 @@ static inline bool ieq(const std::string& a, const char* b) {
     return true;
 }
 
+static inline bool parse_bool(const std::string& v) {
+    return ieq(v, "true") || ieq(v, "1") || ieq(v, "yes") || ieq(v, "on");
+}
+
+// 选最终 .ms 路径：优先用对应 use_road 的新键；新键为空则回退 model_path
+static const std::string& select_model_path(const DeployCfg& c) {
+    if (c.use_road) {
+        return !c.model_path_with_road.empty() ? c.model_path_with_road : c.model_path;
+    } else {
+        return !c.model_path_no_road.empty()   ? c.model_path_no_road   : c.model_path;
+    }
+}
+
 static DeployCfg load_cfg_file(const std::string& path) {
     DeployCfg c;
     std::ifstream ifs(path);
@@ -117,7 +146,10 @@ static DeployCfg load_cfg_file(const std::string& path) {
         std::string k = trim(line.substr(0, pos));
         std::string v = trim(line.substr(pos + 1));
 
-        if      (ieq(k, "model_path"))            c.model_path = v;
+        if      (ieq(k, "use_road"))              c.use_road              = parse_bool(v);
+        else if (ieq(k, "model_path_with_road"))  c.model_path_with_road  = v;
+        else if (ieq(k, "model_path_no_road"))    c.model_path_no_road    = v;
+        else if (ieq(k, "model_path"))            c.model_path            = v;
         else if (ieq(k, "nb_max"))                c.nb_max = std::max(1, std::atoi(v.c_str()));
         else if (ieq(k, "np_max"))                c.np_max = std::max(1, std::atoi(v.c_str()));
         else if (ieq(k, "default_task_type"))     c.default_task_type    = std::atoi(v.c_str());
@@ -240,7 +272,11 @@ static void pack_road_to_tensors(const LocData_route& road,
 }
 
 // ============================================================================
-// MindSpore Lite 推理引擎：按输入名字绑定 7 路 MSTensor
+// MindSpore Lite 推理引擎：按输入名字动态绑定 MSTensor
+//   必需输入（4 路）：hist_traj / task_type / type / position
+//   可选输入：road_points + road_mask（成对，with_road 版才有）
+//             eta（gnn2.enable=true 时才有）
+// 不再硬编码 7 路，构造时按 ONNX 实际输入清单决定 has_road_inputs_/has_eta_input_。
 // ============================================================================
 class TrajSystem::InferenceEngine {
 public:
@@ -260,43 +296,66 @@ public:
         for (size_t i = 0; i < inputs.size(); ++i) {
             name2idx_[inputs[i].Name()] = static_cast<int>(i);
         }
-        for (const char* n : {IN_NAME_HIST, IN_NAME_TASK, IN_NAME_TYPE, IN_NAME_POS,
-                              IN_NAME_RPTS, IN_NAME_RMASK, IN_NAME_ETA}) {
+
+        // 必需输入：缺一个就报错（同时把 .ms 实际清单打出来辅助排查）
+        for (const char* n : {IN_NAME_HIST, IN_NAME_TASK, IN_NAME_TYPE, IN_NAME_POS}) {
             if (name2idx_.find(n) == name2idx_.end()) {
                 std::ostringstream oss;
-                oss << "Cannot find input tensor by name: " << n
+                oss << "Cannot find required input tensor by name: " << n
                     << ". Available inputs:";
                 for (const auto& kv : name2idx_) oss << " '" << kv.first << "'";
                 throw std::runtime_error(oss.str());
             }
         }
 
-        // Resize 一次：batch=1，路网张量绑定到配置的 nb_max/np_max
+        // 可选输入：按 ONNX 实际有无来设置能力位
+        const bool has_rpts  = name2idx_.count(IN_NAME_RPTS)  > 0;
+        const bool has_rmask = name2idx_.count(IN_NAME_RMASK) > 0;
+        if (has_rpts != has_rmask) {
+            throw std::runtime_error(
+                "ONNX 输入异常：road_points 与 road_mask 必须成对出现，"
+                "但当前 .ms 只含其中一个");
+        }
+        has_road_inputs_ = has_rpts && has_rmask;
+        has_eta_input_   = name2idx_.count(IN_NAME_ETA) > 0;
+
+        std::cerr << "[Engine] model=" << model_path
+                  << "  inputs=" << inputs.size()
+                  << "  has_road=" << (has_road_inputs_ ? "true" : "false")
+                  << "  has_eta="  << (has_eta_input_   ? "true" : "false")
+                  << "\n";
+
+        // Resize 一次：batch=1；只对存在的输入设新形状
         std::vector<std::vector<int64_t>> new_shapes(inputs.size());
         for (size_t i = 0; i < inputs.size(); ++i) {
             new_shapes[i] = inputs[i].Shape();   // 默认沿用模型自带的形状
         }
-        new_shapes[name2idx_[IN_NAME_HIST]]   = {1, IN_LEN, IN_COLS};
-        new_shapes[name2idx_[IN_NAME_TASK]]   = {1};
-        new_shapes[name2idx_[IN_NAME_TYPE]]   = {1};
-        new_shapes[name2idx_[IN_NAME_POS]]    = {1, 3};
-        new_shapes[name2idx_[IN_NAME_RPTS]]   = {1, nb_max_, np_max_, 3};
-        new_shapes[name2idx_[IN_NAME_RMASK]]  = {1, nb_max_, np_max_};
-        new_shapes[name2idx_[IN_NAME_ETA]]    = {1};
+        new_shapes[name2idx_[IN_NAME_HIST]] = {1, IN_LEN, IN_COLS};
+        new_shapes[name2idx_[IN_NAME_TASK]] = {1};
+        new_shapes[name2idx_[IN_NAME_TYPE]] = {1};
+        new_shapes[name2idx_[IN_NAME_POS]]  = {1, 3};
+        if (has_road_inputs_) {
+            new_shapes[name2idx_[IN_NAME_RPTS]]  = {1, nb_max_, np_max_, 3};
+            new_shapes[name2idx_[IN_NAME_RMASK]] = {1, nb_max_, np_max_};
+        }
+        if (has_eta_input_) {
+            new_shapes[name2idx_[IN_NAME_ETA]] = {1};
+        }
 
         if (model_.Resize(inputs, new_shapes) != mindspore::kSuccess) {
             throw std::runtime_error("MindSpore Resize failed");
         }
     }
 
-    // 7 路输入；output 至少有 1 个，且第一个为 [1,K,68] float32
+    // 输入按引擎能力位分支：has_road_inputs_=false 时 road_points/road_mask 被忽略；
+    // has_eta_input_=false 时 eta 被忽略。output 至少有 1 个，且第一个为 [1,K,68] float32。
     std::vector<float> forward(const std::vector<float>&    hist,         // [1*20*6]
                                const std::vector<int64_t>&  task_type,    // [1]
                                const std::vector<int64_t>&  type_id,      // [1]
                                const std::vector<float>&    position,     // [1*3]
-                               const std::vector<float>&    road_points,  // [1*NB*NP*3]
-                               const std::vector<uint8_t>&  road_mask,    // [1*NB*NP]
-                               const std::vector<int64_t>&  eta)          // [1]
+                               const std::vector<float>&    road_points,  // [1*NB*NP*3]，可空
+                               const std::vector<uint8_t>&  road_mask,    // [1*NB*NP]，可空
+                               const std::vector<int64_t>&  eta)          // [1]，可空
     {
         auto inputs = model_.GetInputs();
 
@@ -330,9 +389,13 @@ public:
         cpy_i64 (IN_NAME_TASK,  task_type);
         cpy_i64 (IN_NAME_TYPE,  type_id);
         cpy_f32 (IN_NAME_POS,   position);
-        cpy_f32 (IN_NAME_RPTS,  road_points);
-        cpy_bool(IN_NAME_RMASK, road_mask);
-        cpy_i64 (IN_NAME_ETA,   eta);
+        if (has_road_inputs_) {
+            cpy_f32 (IN_NAME_RPTS,  road_points);
+            cpy_bool(IN_NAME_RMASK, road_mask);
+        }
+        if (has_eta_input_) {
+            cpy_i64(IN_NAME_ETA, eta);
+        }
 
         std::vector<mindspore::MSTensor> outputs;
         if (model_.Predict(inputs, &outputs) != mindspore::kSuccess || outputs.empty()) {
@@ -345,14 +408,18 @@ public:
         return std::vector<float>(p, p + n);
     }
 
-    int nb_max() const { return nb_max_; }
-    int np_max() const { return np_max_; }
+    int  nb_max()           const { return nb_max_; }
+    int  np_max()           const { return np_max_; }
+    bool has_road_inputs()  const { return has_road_inputs_; }
+    bool has_eta_input()    const { return has_eta_input_; }
 
 private:
     mindspore::Model                       model_;
     std::unordered_map<std::string, int>   name2idx_;
-    int                                    nb_max_ = 4;
-    int                                    np_max_ = 128;
+    int                                    nb_max_           = 4;
+    int                                    np_max_           = 128;
+    bool                                   has_road_inputs_  = false;
+    bool                                   has_eta_input_    = false;
 };
 
 // ============================================================================
@@ -366,7 +433,8 @@ static inline bool finite_f(float v) {
 // TrajSystem 实现
 // ============================================================================
 TrajSystem::TrajSystem() {
-    // engine_ 延迟构造（首次 Feed 时按 cfg.model_path / nb_max / np_max 构）
+    // engine_ 延迟构造：首次 Feed 时按 select_model_path(cfg) / nb_max / np_max
+    // 选择 with_road / no_road .ms 加载，并校验与 use_road 是否匹配
 }
 
 void TrajSystem::Feed(const std::vector<LocData_loc>& data_loc,
@@ -376,7 +444,25 @@ void TrajSystem::Feed(const std::vector<LocData_loc>& data_loc,
     instant_ms_ = std::max(1, instant_ms);
 
     if (!engine_) {
-        engine_ = new InferenceEngine(g_cfg.model_path, g_cfg.nb_max, g_cfg.np_max);
+        const std::string& mp = select_model_path(g_cfg);
+        if (mp.empty()) {
+            throw std::runtime_error(
+                "No model path configured: please set model_path_with_road / "
+                "model_path_no_road (or legacy model_path) in deploy_cfg.ini");
+        }
+        engine_ = new InferenceEngine(mp, g_cfg.nb_max, g_cfg.np_max);
+
+        // use_road 与 .ms 实际输入一致性校验
+        if (g_cfg.use_road && !engine_->has_road_inputs()) {
+            throw std::runtime_error(
+                "use_road=true 但 .ms 没有 road_points/road_mask 输入；"
+                "请检查 model_path_with_road 是否真的指向 with_road 版 .ms");
+        }
+        if (!g_cfg.use_road && engine_->has_road_inputs()) {
+            std::cerr << "[WARN] use_road=false 但 .ms 含 road 输入，"
+                         "将传入 mask 全 false 走 fallback；"
+                         "建议改用 no_road 版以减小模型 / 缩短推理\n";
+        }
     }
 
     // 追加观测并按 time 排序
@@ -392,7 +478,8 @@ void TrajSystem::Feed(const std::vector<LocData_loc>& data_loc,
     }
 
     // 缓存最新一张路网（保留 LLH 原始结构；坐标变换要等到 Infer 时才能定原点）
-    if (!data_route.empty()) {
+    // use_road=false 时直接丢弃，省一次 ENU 转换 + 内存占用
+    if (g_cfg.use_road && !data_route.empty()) {
         last_road_ = data_route.back();
         has_road_ = !last_road_.branches.empty();
     }
@@ -466,7 +553,12 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
 
     std::vector<int64_t> task_buf{ static_cast<int64_t>(task_type) };
     std::vector<int64_t> type_buf{ static_cast<int64_t>(our_type) };
-    std::vector<int64_t> eta_buf { eta_sec };
+
+    // eta 仅在 .ms 含 eta 输入时构造；否则空 vector，forward 内部会跳过 memcpy
+    std::vector<int64_t> eta_buf;
+    if (engine_->has_eta_input()) {
+        eta_buf.push_back(eta_sec);
+    }
 
     std::vector<float> pos_buf(3, 0.0f);
     {
@@ -480,18 +572,23 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
     }
 
     // ----------------- 3) road_points / road_mask -----------------
+    // 仅在引擎确实含 road 输入时才打包；no_road .ms 下全跳过
     std::vector<float>   rp_buf;
     std::vector<uint8_t> rm_buf;
-    if (has_road_) {
-        pack_road_to_tensors(last_road_,
-                             origin_lon, origin_lat, origin_alt_m,
-                             engine_->nb_max(), engine_->np_max(),
-                             rp_buf, rm_buf);
-    } else {
-        // 无路网：全 0 + mask=false；fusion 内部 _normalize_ctx 等价跳过路网投影
+    if (engine_->has_road_inputs()) {
         const size_t cap = static_cast<size_t>(engine_->nb_max()) * engine_->np_max();
-        rp_buf.assign(cap * 3, 0.0f);
-        rm_buf.assign(cap, 0u);
+        if (g_cfg.use_road && has_road_) {
+            pack_road_to_tensors(last_road_,
+                                 origin_lon, origin_lat, origin_alt_m,
+                                 engine_->nb_max(), engine_->np_max(),
+                                 rp_buf, rm_buf);
+        } else {
+            // 无路网或 use_road=false：全 0 + mask=false
+            // ConstraintOptimizer 向量化版用 torch.where(branch_has_seg, ...) 走 fallback，
+            // 等价于不做路网投影
+            rp_buf.assign(cap * 3, 0.0f);
+            rm_buf.assign(cap, 0u);
+        }
     }
 
     // ----------------- 4) forward -----------------
