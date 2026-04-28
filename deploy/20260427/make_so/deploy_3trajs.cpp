@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -437,6 +438,10 @@ void TrajSystem::Feed(const std::vector<LocData_loc>& data_loc,
                       const std::vector<LocData_route>& data_route,
                       int instant_ms) {
     ensure_cfg_loaded_once();
+    // instant_ms_ → target_spacing_s = round(instant_ms_ / 1000)，等比例缩放：
+    //   buffer 容量上限 / Infer 的成熟跨度 / picked 网格 / 未来步长全部按它放缩。
+    //   模型按 60s 步长训练，instant_ms=60000 时各项语义与训练一致；其它值 Infer
+    //   会打 [WARN/Infer]，预测精度可能下降。
     instant_ms_ = std::max(1, instant_ms);
 
     if (!engine_) {
@@ -467,9 +472,21 @@ void TrajSystem::Feed(const std::vector<LocData_loc>& data_loc,
         return a.time < b.time;
     });
 
-    // 控制 20 分钟容量
-    const int need_cap = static_cast<int>(std::llround(20.0 * 60.0 * 1000.0 / instant_ms_));
-    while (static_cast<int>(buffer_.size()) > need_cap) {
+    // 时间跨度上限 = (IN_LEN + 5) * 单帧间隔；多缓存 6 帧用来吃 jitter / 延迟。
+    //   instant_ms=60s  → 上限 25min（与旧版 20min 容量+5min 余量等效）
+    //   instant_ms=30s  → 上限 12.5min（推理窗口 9.5min + 3min 余量）
+    //   instant_ms=120s → 上限 50min（推理窗口 38min + 12min 余量）
+    // 硬上限 100k 条防内存爆炸（极快采样 + 超长跨度时兜底）。
+    const int64_t target_spacing_s_for_cap = std::max<int64_t>(1, std::llround(
+        static_cast<double>(instant_ms_) / 1000.0));
+    const int64_t MAX_BUFFER_SPAN_S =
+        static_cast<int64_t>(IN_LEN + 5) * target_spacing_s_for_cap;
+    constexpr size_t  MAX_BUFFER_COUNT  = 100000;
+    while (!buffer_.empty() &&
+           (buffer_.back().time - buffer_.front().time) > MAX_BUFFER_SPAN_S) {
+        buffer_.pop_front();
+    }
+    while (buffer_.size() > MAX_BUFFER_COUNT) {
         buffer_.pop_front();
     }
 
@@ -486,26 +503,76 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
                        std::map<int, std::vector<double>>& strike_areas,
                        std::vector<double>& area_prob) {
     if (!engine_) return false;
+    if (buffer_.empty()) return false;
 
-    const int need_cap = static_cast<int>(
-        std::llround(20.0 * 60.0 * 1000.0 / std::max(1, instant_ms_)));
-    if (static_cast<int>(buffer_.size()) < need_cap) return false;
+    // ===== 单帧间隔 = instant_ms / 1000 =====
+    // target 网格随上层 instant_ms 等比例缩放：
+    //   instant_ms=60s  → target_spacing_s=60，buffer 需 19*60=1140s≈19min
+    //   instant_ms=30s  → target_spacing_s=30，buffer 需 19*30=570s≈10min
+    //   instant_ms=120s → target_spacing_s=120，buffer 需 19*120=2280s=38min
+    // 注意：模型按 60s 步长训练；target_spacing_s ≠ 60 时，模型把"30s/120s 的
+    // delta_pos / vel"误读成 60s，预测精度会下降，会打 [WARN/Infer] 日志。
+    const int64_t target_spacing_s = std::max<int64_t>(1, std::llround(
+        static_cast<double>(instant_ms_) / 1000.0));
+    if (target_spacing_s != 60) {
+        std::cerr << "[WARN/Infer] target_spacing_s = " << target_spacing_s
+                  << "s ≠ 60s（模型按 60s 训练），buffer 按 "
+                  << (IN_LEN - 1) * target_spacing_s
+                  << "s 跨度成熟，但 hist 的 delta/vel 尺度会被模型误读，"
+                     "预测精度可能下降\n";
+    }
 
-    // 每 60s 取一个点；不够就用末帧补足
-    const int hop = std::max(1, static_cast<int>(
-        std::llround(60.0 * 1000.0 / std::max(1, instant_ms_))));
+    // ===== 成熟判定：buffer 真实时间跨度 >= 19 * target_spacing_s =====
+    // 直接看时间戳跨度，对 jitter / 丢帧 / instant_ms 估错都鲁棒。
+    // 模型要 20 帧，最早一帧对应 t_end - 19*target_spacing_s。
+    const int64_t SPAN_S = static_cast<int64_t>(IN_LEN - 1) * target_spacing_s;
+    const int64_t t_end   = buffer_.back().time;
+    const int64_t t_start = buffer_.front().time;
+    if (t_end - t_start < SPAN_S) return false;
+
+    // ===== 选点：按 time 找最近邻，目标网格 = t_end - (19-i)*target_spacing_s =====
+    // i=0..19 对应 hist 的 0~19 个等距锚点（间距 = target_spacing_s）；
+    // 上层观测周期 = target_spacing_s 时，picked[i] 几乎与第 i 帧观测重合；
+    // 周期与 target_spacing_s 不一致时，picked[i] = buffer 里 time 最接近的观测。
+    //
+    // 因为 buffer_ 已升序、target_time[i] 也升序，用单调推进的 cursor 即可，
+    // 不需要二分；总扫描成本 O(buffer_size + IN_LEN)。
     std::vector<LocData_loc> picked;
     picked.reserve(IN_LEN);
-    int idx = 0;
-    for (auto it = buffer_.begin();
-         it != buffer_.end() && static_cast<int>(picked.size()) < IN_LEN;
-         ++it, ++idx) {
-        if (idx % hop == 0) picked.push_back(*it);
+    auto cursor = buffer_.begin();
+    int  jitter_warn = 0;
+    int64_t worst_jitter_s = 0;
+    const int64_t jitter_threshold_s = std::max<int64_t>(1, target_spacing_s / 2);
+
+    for (int i = 0; i < IN_LEN; ++i) {
+        const int64_t t_target = t_end -
+            static_cast<int64_t>(IN_LEN - 1 - i) * target_spacing_s;
+
+        // 把 cursor 推到 "time <= t_target" 的最右一条
+        while (std::next(cursor) != buffer_.end() &&
+               std::next(cursor)->time <= t_target) {
+            ++cursor;
+        }
+        // 比较 cursor 与 cursor+1，取离 t_target 更近的一条作为 picked[i]
+        auto best = cursor;
+        int64_t best_diff = std::llabs(cursor->time - t_target);
+        if (std::next(cursor) != buffer_.end()) {
+            const int64_t d2 = std::llabs(std::next(cursor)->time - t_target);
+            if (d2 < best_diff) { best = std::next(cursor); best_diff = d2; }
+        }
+        picked.push_back(*best);
+
+        // 记录 jitter；超过单帧间隔的一半就累计计数
+        if (best_diff > jitter_threshold_s) ++jitter_warn;
+        if (best_diff > worst_jitter_s) worst_jitter_s = best_diff;
     }
-    if (static_cast<int>(picked.size()) < IN_LEN) {
-        auto it = buffer_.end();
-        --it;
-        while (static_cast<int>(picked.size()) < IN_LEN) picked.push_back(*it);
+
+    if (jitter_warn > 0) {
+        std::cerr << "[WARN/Infer] " << jitter_warn << "/" << IN_LEN
+                  << " 帧最近邻偏差 > " << jitter_threshold_s
+                  << "s（最大 " << worst_jitter_s << "s），模型按 "
+                  << target_spacing_s << "s 步长解读 hist，精度可能下降；"
+                     "请检查上层观测周期是否稳定 / 是否有丢帧\n";
     }
 
     // ENU 原点 = hist 末帧 LLH（与 fusion README 一致）
@@ -631,8 +698,13 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
                           origin_lon, origin_lat, origin_alt_m,
                           lon, lat, alt_m);
             LocData_pred r = picked.back();
-            // 与旧版保持一致：前 9 步每步 +60s，第 10 步 +600s
-            r.time = base_ts + (t < OUT_LEN - 1 ? (t + 1) * 60 : 600);
+            // 未来 10 步以 target_spacing_s 等距向前推。
+            //   target_spacing_s=60: r.time = base + 60, 120, ..., 540, 600
+            //                        与旧版"前 9 步 +60s + 第 10 步 +600s"完全一致
+            //                        （旧逻辑里 (9+1)*60=600,特例分支等价于无操作）
+            //   target_spacing_s=30: r.time = base + 30, 60, ..., 270, 300（10 帧 = 5min）
+            //   target_spacing_s=120:r.time = base + 120, 240, ..., 1080, 1200（10 帧 = 20min）
+            r.time = base_ts + static_cast<int64_t>(t + 1) * target_spacing_s;
             r.Lon  = lon;
             r.Lat  = lat;
             r.Alt  = alt_m;

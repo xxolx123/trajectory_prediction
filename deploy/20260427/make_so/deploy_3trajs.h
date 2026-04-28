@@ -95,19 +95,35 @@ namespace deploy_defaults {
 }
 
 // ----------------------------------------------------------------------------
-// 封装系统：缓冲式喂入，满 20 分钟后输出 4 元组
+// 封装系统：缓冲式喂入，满 (IN_LEN-1) * target_spacing_s 跨度后输出 4 元组
+//
+// 内部选点策略（重要）：
+//   - 单帧间隔 target_spacing_s = round(instant_ms / 1000)，**等比例缩放**：
+//       instant_ms=60000  → target_spacing_s=60s  ，buffer 需 19min
+//       instant_ms=30000  → target_spacing_s=30s  ，buffer 需 ≈10min
+//       instant_ms=120000 → target_spacing_s=120s ，buffer 需 38min
+//   - Infer() 用 LocData_loc.time 字段驱动；目标网格 = {t_end - (19-i)*target_spacing_s,
+//     i=0..19}，对每个 target_time 在 buffer 里找 time 最接近的那条作为 hist[i]。
+//   - 未来 10 步预测时间戳 = base_ts + (t+1) * target_spacing_s，也等比缩放。
+//   - 模型按 60s 训练；当 target_spacing_s ≠ 60 时，hist 的 delta_pos / vel 会被
+//     模型误读为 60s 时间尺度，预测精度会下降，会打 [WARN/Infer] 日志。
+//   - 选点的 jitter 阈值 = target_spacing_s / 2，超过会再打 WARN（不阻断推理）。
 // ----------------------------------------------------------------------------
 class TrajSystem {
 public:
     TrajSystem();   // 配置从 deploy_cfg.ini 读取（路径、nb_max/np_max、默认值）
 
-    // instant_ms: 观测步长（毫秒），用于把缓冲长度折算成 20 分钟容量
+    // instant_ms: 观测步长（毫秒），决定 target_spacing_s = round(instant_ms / 1000)。
+    //             buffer 容量上限 / 成熟跨度 / picked 网格 / 未来步长全部按
+    //             target_spacing_s 等比例缩放。**模型按 60s 训练，强烈建议 instant_ms=60000**；
+    //             其它取值仍可工作，但精度会下降并打 WARN 日志。
     void Feed(const std::vector<LocData_loc>& data_loc,
               const std::vector<LocData_route>& data_route,
               int instant_ms);
 
-    // 满 20 分钟返回 true；否则 false
+    // buffer 时间跨度 ≥ 19 * target_spacing_s 时返回 true，否则 false
     //   pred_trace[m]   ：第 m 条候选未来 10 步（含末步的 intent / threat 写在 Type/Threat 字段）
+    //                     未来时间戳 = base_ts + (t+1) * target_spacing_s（t=0..9）
     //   trace_prob      ：mode_prob（gnn1 重归一化，K 条和=1）
     //   strike_areas[m] ：{lon, lat, z_km, radius_km}（若 fusion 输出 NaN 兜底全 0）
     //   area_prob[m]    ：strike_conf ∈ [0, 1]（若 fusion 输出 NaN 兜底 0）
@@ -121,8 +137,8 @@ private:
 
 private:
     std::list<LocData_loc> buffer_;
-    int                    instant_ms_ = 1000;
-    LocData_route          last_road_;       // 仅缓存原始 LLH 折线，原点要用推理时的 hist 末帧
+    int                    instant_ms_ = 1000;   // 用来推 target_spacing_s
+    LocData_route          last_road_;           // 仅缓存原始 LLH 折线，原点要用推理时的 hist 末帧
     bool                   has_road_ = false;
-    InferenceEngine*       engine_   = nullptr;   // 延迟构造
+    InferenceEngine*       engine_   = nullptr;  // 延迟构造
 };
