@@ -28,11 +28,13 @@ constraint_optimizer:
   config: "../constraint_optimizer/config.yaml"
   ckpt:   ""                                          # 当前模块无可学权重
 
-# lstm2 目前是占位 MLP，未训练；默认关闭
+# lstm2：意图 + 威胁度（小型 Transformer Encoder，已训练）
+# 新接口（BREAKING）：fusion 端 (engineer 11-dim → 用 lstm2.scaler 归一化 → 喂模型)
 lstm2:
-  enable: false
+  enable: true
   config: "../lstm2/config.yaml"
-  ckpt:   ""
+  ckpt:   "../lstm2/checkpoints"                          # 自动取目录下最新 .pt
+  scaler: "../lstm2/data/processed/scaler_intent_posvel.npz"
 
 # gnn2 目前是占位 MLP，未训练；默认关闭
 gnn2:

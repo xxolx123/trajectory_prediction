@@ -329,3 +329,214 @@ __all__ = [
     "IntentLSTM",
     "build_model_from_config",
 ]
+
+
+# =============================================================================
+# 备选：手写 attention 版本的 IntentTransformer（默认注释掉，保留代码备查）
+# =============================================================================
+#
+# 用途
+# ----
+# 当部署目标只支持 ONNX opset ≤ 13 时（老版 ORT / 特定推理引擎），
+# nn.TransformerEncoder 内部的 `scaled_dot_product_attention` 算子
+# 要 opset ≥ 14，无法导出。
+#
+# 这个手写版本用 `Q · K^T → softmax → · V` 显式表达 attention，
+# 仅用 matmul / softmax / layer_norm / linear / gelu 等基础算子，
+# 任何 opset（甚至 9）都能导出。
+#
+# 关键设计：state_dict 的 key 与 nn.TransformerEncoder 完全一致，
+# 所以用现有 IntentTransformer 训练好的 ckpt 可以直接 load 进
+# IntentTransformerManual，不需要重训。
+#
+# 数学等价性：pre-LN + 单头/多头 SDPA 数学定义完全一致，
+# 输出应当 bit-for-bit（或受浮点累积顺序影响在 1e-6 以内）一致。
+#
+# 使用方法（如果某天需要解开）
+# --------------------------
+# 1. 把下面整段（从 `# import math` 起到 `# IntentTransformerManual end`）
+#    每行最前面的 `# ` 删掉
+# 2. 在 build_model_from_config 里把 `model_type == "transformer"` 分支换成
+#    `IntentTransformerManual(...)`（参数同 IntentTransformer）
+# 3. 训练好的 ckpt 直接 load：
+#        model = IntentTransformerManual(...)
+#        model.load_state_dict(torch.load("best_intent_*.pt"))
+# 4. fusion/code/export_onnx.py 的 --opset 可以改回 11/13
+#
+# -----------------------------------------------------------------------------
+# import math
+# from torch.nn import functional as F
+#
+#
+# class _ManualMultiheadAttention(nn.Module):
+#     """
+#     与 nn.MultiheadAttention 数值等价、参数布局完全一致的手写版本。
+#
+#     state_dict keys（严格匹配 nn.MultiheadAttention）：
+#         in_proj_weight     [3*d_model, d_model]
+#         in_proj_bias       [3*d_model]
+#         out_proj.weight    [d_model, d_model]
+#         out_proj.bias      [d_model]
+#     """
+#
+#     def __init__(self, d_model: int, nhead: int, dropout: float = 0.0) -> None:
+#         super().__init__()
+#         if d_model % nhead != 0:
+#             raise ValueError(f"d_model({d_model}) 必须能被 nhead({nhead}) 整除")
+#         self.d_model = int(d_model)
+#         self.nhead = int(nhead)
+#         self.head_dim = self.d_model // self.nhead
+#         self.dropout_p = float(dropout)
+#
+#         # 与 nn.MultiheadAttention 完全相同的参数布局
+#         self.in_proj_weight = nn.Parameter(torch.empty(3 * self.d_model, self.d_model))
+#         self.in_proj_bias = nn.Parameter(torch.empty(3 * self.d_model))
+#         self.out_proj = nn.Linear(self.d_model, self.d_model)
+#
+#         self._reset_parameters()
+#
+#     def _reset_parameters(self) -> None:
+#         nn.init.xavier_uniform_(self.in_proj_weight)
+#         nn.init.zeros_(self.in_proj_bias)
+#         nn.init.xavier_uniform_(self.out_proj.weight)
+#         nn.init.zeros_(self.out_proj.bias)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, T, D]
+#         B, T, D = x.shape
+#         qkv = F.linear(x, self.in_proj_weight, self.in_proj_bias)        # [B, T, 3D]
+#         q, k, v = qkv.chunk(3, dim=-1)                                   # 3 x [B, T, D]
+#
+#         def split_heads(t: torch.Tensor) -> torch.Tensor:
+#             return t.view(B, T, self.nhead, self.head_dim).transpose(1, 2)  # [B, h, T, hd]
+#
+#         q, k, v = split_heads(q), split_heads(k), split_heads(v)
+#         scale = 1.0 / math.sqrt(self.head_dim)
+#         attn = torch.matmul(q, k.transpose(-2, -1)) * scale              # [B, h, T, T]
+#         attn = F.softmax(attn, dim=-1)
+#         if self.dropout_p > 0.0 and self.training:
+#             attn = F.dropout(attn, p=self.dropout_p)
+#         out = torch.matmul(attn, v)                                      # [B, h, T, hd]
+#         out = out.transpose(1, 2).contiguous().view(B, T, D)             # [B, T, D]
+#         return self.out_proj(out)
+#
+#
+# class _ManualEncoderLayer(nn.Module):
+#     """
+#     pre-LN + GELU FFN，结构与 nn.TransformerEncoderLayer(norm_first=True) 一致。
+#
+#     state_dict keys：
+#         self_attn.{in_proj_weight, in_proj_bias, out_proj.weight, out_proj.bias}
+#         linear1.{weight, bias}        FFN 第一层（d_model → ffn_dim）
+#         linear2.{weight, bias}        FFN 第二层（ffn_dim → d_model）
+#         norm1.{weight, bias}          attention 前的 LN
+#         norm2.{weight, bias}          FFN 前的 LN
+#     """
+#
+#     def __init__(
+#         self,
+#         d_model: int,
+#         nhead: int,
+#         dim_feedforward: int,
+#         dropout: float = 0.1,
+#     ) -> None:
+#         super().__init__()
+#         self.self_attn = _ManualMultiheadAttention(d_model, nhead, dropout=dropout)
+#         self.linear1 = nn.Linear(d_model, dim_feedforward)
+#         self.dropout = nn.Dropout(dropout)
+#         self.linear2 = nn.Linear(dim_feedforward, d_model)
+#         self.norm1 = nn.LayerNorm(d_model)
+#         self.norm2 = nn.LayerNorm(d_model)
+#         self.dropout1 = nn.Dropout(dropout)
+#         self.dropout2 = nn.Dropout(dropout)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         x = x + self.dropout1(self.self_attn(self.norm1(x)))
+#         x = x + self.dropout2(
+#             self.linear2(self.dropout(F.gelu(self.linear1(self.norm2(x)))))
+#         )
+#         return x
+#
+#
+# class _ManualTransformerEncoder(nn.Module):
+#     """state_dict keys: layers.{i}.<EncoderLayer keys>"""
+#     def __init__(self, layer_factory, num_layers: int) -> None:
+#         super().__init__()
+#         self.layers = nn.ModuleList([layer_factory() for _ in range(num_layers)])
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         for layer in self.layers:
+#             x = layer(x)
+#         return x
+#
+#
+# class IntentTransformerManual(nn.Module):
+#     """
+#     与 IntentTransformer 数值等价、ckpt 兼容的手写 attention 版本。
+#     可导出到任意 ONNX opset（含 11/13）。
+#
+#     state_dict keys 与 IntentTransformer 完全一致：
+#         input_proj.{weight, bias}
+#         pos_embed
+#         encoder.layers.{i}.<...>
+#         intent_head.{weight, bias}
+#         threat_head.{weight, bias}
+#     """
+#
+#     def __init__(
+#         self,
+#         input_size: int = 11,
+#         d_model: int = 128,
+#         nhead: int = 4,
+#         num_layers: int = 2,
+#         ffn_dim: int = 256,
+#         dropout: float = 0.1,
+#         num_intent_classes: int = 4,
+#         max_seq_len: int = 32,
+#     ) -> None:
+#         super().__init__()
+#         self.input_size = int(input_size)
+#         self.d_model = int(d_model)
+#         self.num_intent_classes = int(num_intent_classes)
+#         self.max_seq_len = int(max_seq_len)
+#
+#         self.input_proj = nn.Linear(self.input_size, self.d_model)
+#         self.pos_embed = nn.Parameter(torch.zeros(self.max_seq_len, self.d_model))
+#         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+#
+#         def _layer_factory():
+#             return _ManualEncoderLayer(
+#                 d_model=self.d_model,
+#                 nhead=int(nhead),
+#                 dim_feedforward=int(ffn_dim),
+#                 dropout=float(dropout),
+#             )
+#
+#         self.encoder = _ManualTransformerEncoder(_layer_factory, int(num_layers))
+#
+#         self.intent_head = nn.Linear(self.d_model * 2, self.num_intent_classes)
+#         self.threat_head = nn.Linear(self.d_model * 2, 1)
+#
+#     def forward(
+#         self,
+#         fut_refined: torch.Tensor,
+#         position: torch.Tensor,
+#     ) -> Dict[str, torch.Tensor]:
+#         feat = _maybe_make_features(fut_refined, position)               # [B, T, 11]
+#         B, T, _ = feat.shape
+#         if T > self.max_seq_len:
+#             raise ValueError(f"序列长度 T={T} 超出 max_seq_len={self.max_seq_len}")
+#
+#         x = self.input_proj(feat)                                        # [B, T, d]
+#         x = x + self.pos_embed[:T].unsqueeze(0)
+#         h = self.encoder(x)                                              # [B, T, d]
+#
+#         h_mean = h.mean(dim=1)
+#         h_max = h.max(dim=1).values
+#         pooled = torch.cat([h_mean, h_max], dim=-1)                      # [B, 2d]
+#
+#         return {
+#             "logits_intent": self.intent_head(pooled),
+#             "threat_raw":    self.threat_head(pooled),
+#         }
+# # IntentTransformerManual end
+# =============================================================================

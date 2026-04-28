@@ -103,7 +103,25 @@ def _build_dummy_inputs(
     device: torch.device,
     batch_size: int = 1,
 ) -> tuple:
-    """构造一组 dummy 张量，用于 torch.onnx.export 的 args。"""
+    """
+    构造一组 dummy 张量，用于 torch.onnx.export 的 args。
+
+    ⚠️ 已知遗留问题（**不在本次 lstm2 接入范围内**）：
+       road_mask 当前用全 False。这样 trace 时会让 ConstraintOptimizer 内
+       `if not bool(rm.any()): return selected_traj` 这条 fallback 走早退分支，
+       结果 ONNX 的 graph.input 里 road_points / road_mask / eta 三路会被
+       裁掉，**实际导出后只有 4 个 input**（hist_traj / task_type / type / position）。
+
+       想拿到完整 7-input ONNX 必须先把 ConstraintOptimizer 的
+       `_road_arc_projection` 整段重写：消除 Python `for n in range(N)` 循环、
+       `.item()` 调用、布尔索引 `rp[n,bi][mask_nb]`、以及 `torch.searchsorted`
+       （PyTorch 现行版本没有对应 ONNX symbolic）。这是一项独立的较大改造，
+       与 fusion 接入 lstm2 无关，建议另起任务处理。
+
+       临时方案：保留全 0 输入，让 trace 走 pass-through 路径。导出的 4-input
+       ONNX 仍可用于"无路网"场景，等 ConstraintOptimizer trace 化重构后
+       再恢复 7-input 完整版本即可。
+    """
     B = int(batch_size)
     hist_len = int(full_net.hist_len)
     feat_dim = int(full_net.feature_dim)
@@ -127,8 +145,16 @@ def _build_dummy_inputs(
 def export_onnx(
     fusion_cfg_path: Path,
     onnx_out: Path,
-    opset: int = 13,
+    opset: int = 17,
 ) -> None:
+    """
+    导出 FullNetV2 为 ONNX。
+
+    opset 默认 17（ORT 1.13+，2022 年起广泛支持）：
+      - opset ≥ 14：lstm2 的 Transformer 内部 `scaled_dot_product_attention` 算子
+      - opset ≥ 16：constraint_optimizer 的 `searchsorted` 算子（用于路网弧长查找）
+      - opset 17：取最近有保障的版本，避免上限风险
+    """
     full_net = build_full_net_from_fusion_config(fusion_cfg_path)
     full_net.eval()
     device = next(full_net.parameters()).device
@@ -172,7 +198,10 @@ def main() -> None:
         help="fusion/config.yaml 的路径",
     )
     parser.add_argument("--onnx-out", type=str, required=True)
-    parser.add_argument("--opset", type=int, default=13)
+    parser.add_argument("--opset", type=int, default=17,
+                        help="ONNX opset；默认 17"
+                             "（lstm2 Transformer 需 ≥14，constraint_optimizer "
+                             "searchsorted 需 ≥16；17 取较新带保障版本）")
     args = parser.parse_args()
 
     fusion_cfg_path = Path(args.fusion_config).resolve()

@@ -156,15 +156,19 @@ def build_subnetworks(
     int,                                  # lstm1_modes
     int,                                  # top_k
     Dict[str, bool],                      # enable_flags
+    Optional[np.ndarray],                 # lstm2_mean (11 维；lstm2 关闭时 None)
+    Optional[np.ndarray],                 # lstm2_std  (11 维；lstm2 关闭时 None)
 ]:
     """
     返回 (lstm1, gnn1, constraint, lstm2, gnn2, mean_A, std_A,
-          lstm1_modes, top_k, enable_flags)
+          lstm1_modes, top_k, enable_flags, lstm2_mean, lstm2_std)
 
     - constraint / lstm2 / gnn2 在 enable=false 时为 None
     - lstm1_modes: LSTM1 的候选数 M（来自 lstm1_cfg.model.modes）
     - top_k:       GNN1 保留的 top-K（来自 gnn1_cfg.model.top_k，缺省 3）
     - enable_flags: {'lstm1', 'gnn1', 'constraint_optimizer', 'lstm2', 'gnn2': bool}
+    - lstm2_mean / lstm2_std: 11 维 StandardScaler 参数；lstm2 关闭时 None；
+      lstm2 启用但 scaler 文件缺失时 fallback 全 0 / 全 1（带 WARN）
     """
 
     enable_flags: Dict[str, bool] = {}
@@ -221,6 +225,28 @@ def build_subnetworks(
     )
     enable_flags["lstm2"] = en
 
+    # ---- LSTM2 11 维 scaler ----
+    # 新接口（BREAKING）：fusion 内做 (engineer 11-dim → normalize) 后喂 lstm2，
+    # 所以这里必须把 lstm2 训练时的 StandardScaler 拉过来。
+    lstm2_mean: Optional[np.ndarray] = None
+    lstm2_std: Optional[np.ndarray] = None
+    if enable_flags["lstm2"]:
+        lstm2_sec = fusion_cfg.get("lstm2", {}) or {}
+        lstm2_scaler_path = _resolve_rel(
+            lstm2_sec.get("scaler", ""), fusion_cfg_dir,
+        )
+        if lstm2_scaler_path is not None and lstm2_scaler_path.exists():
+            lstm2_mean, lstm2_std = load_mean_std_from_npz(lstm2_scaler_path)
+            print(f"[Fusion] LSTM2: 载入 scaler {lstm2_scaler_path}")
+        else:
+            lstm2_mean = np.zeros((11,), dtype=np.float32)
+            lstm2_std = np.ones((11,), dtype=np.float32)
+            print(
+                f"[Fusion] LSTM2[WARN]: 未找到 scaler "
+                f"({lstm2_scaler_path})，使用 mean=0/std=1 兜底；"
+                f"lstm2 输出可能严重偏差，请检查 lstm2.scaler 配置。"
+            )
+
     # ---- GNN2（可选）----
     gnn2, _, en = _build_optional(
         fusion_cfg, "gnn2", build_gnn2, fusion_cfg_dir, tag="GNN2",
@@ -232,6 +258,7 @@ def build_subnetworks(
         mean_A, std_A,
         lstm1_modes, top_k,
         enable_flags,
+        lstm2_mean, lstm2_std,
     )
 
 

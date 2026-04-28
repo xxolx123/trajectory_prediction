@@ -96,6 +96,9 @@ SCALAR_NAN = float("nan")    # threat_prob / strike_* 禁用时填 NaN
 # ==============================================================================
 
 class FullNetV2(nn.Module):
+    # LSTM2 输入工程化后维度（6 原始 + 3 Δ + 1 dist + 1 speed）
+    LSTM2_INPUT_DIM = 11
+
     def __init__(
         self,
         lstm1: nn.Module,
@@ -113,6 +116,8 @@ class FullNetV2(nn.Module):
         use_delta_A: bool = True,
         n_intent_classes: int = 4,
         enable_flags: Optional[Dict[str, bool]] = None,
+        lstm2_mean=None,
+        lstm2_std=None,
     ) -> None:
         super().__init__()
 
@@ -154,11 +159,27 @@ class FullNetV2(nn.Module):
             }
         self.enable_flags: Dict[str, bool] = dict(enable_flags)
 
+        # ---- LSTM1 A 域 scaler（6 维）----
         mean_A_t = torch.as_tensor(np.asarray(mean_A, dtype=np.float32)).view(1, 1, self.feature_dim)
         std_A_t = torch.as_tensor(np.asarray(std_A, dtype=np.float32)).view(1, 1, self.feature_dim)
         std_A_t = torch.where(std_A_t.abs() < 1e-6, torch.ones_like(std_A_t), std_A_t)
         self.register_buffer("mean_A", mean_A_t)
         self.register_buffer("std_A", std_A_t)
+
+        # ---- LSTM2 11 维 scaler（即使 lstm2 关闭也注册 0/1 占位，避免 forward 分支）----
+        if lstm2_mean is not None and lstm2_std is not None:
+            mean_l = torch.as_tensor(
+                np.asarray(lstm2_mean, dtype=np.float32)
+            ).view(1, 1, self.LSTM2_INPUT_DIM)
+            std_l = torch.as_tensor(
+                np.asarray(lstm2_std, dtype=np.float32)
+            ).view(1, 1, self.LSTM2_INPUT_DIM)
+            std_l = torch.where(std_l.abs() < 1e-6, torch.ones_like(std_l), std_l)
+        else:
+            mean_l = torch.zeros(1, 1, self.LSTM2_INPUT_DIM, dtype=torch.float32)
+            std_l = torch.ones(1, 1, self.LSTM2_INPUT_DIM, dtype=torch.float32)
+        self.register_buffer("mean_lstm2", mean_l)
+        self.register_buffer("std_lstm2", std_l)
 
     # --------- A 域归一化工具 ---------
     def _norm_A(self, x: torch.Tensor) -> torch.Tensor:
@@ -297,6 +318,25 @@ class FullNetV2(nn.Module):
     def _full(shape, value, dtype, device) -> torch.Tensor:
         return torch.full(shape, value, dtype=dtype, device=device)
 
+    # --------- LSTM2 11 维特征工程（与 lstm2/data/dataset.py 的 numpy 版对齐）---------
+    @staticmethod
+    def _engineer_lstm2_features(
+        fut: torch.Tensor,           # [N, T, 6]   物理 km / km·s⁻¹
+        position: torch.Tensor,      # [N, 3]      物理 km
+    ) -> torch.Tensor:
+        """
+        把 (fut [N,T,6], position [N,3]) 扩展到 [N,T,11]：
+            [x, y, z, vx, vy, vz, dx, dy, dz, ||Δ||, ||v||]
+        其中 (dx, dy, dz) = pos_t - position。
+        与 lstm2/code/data/dataset.py:engineer_features_np 完全等价（torch 版）。
+        """
+        pos = fut[..., 0:3]                                            # [N, T, 3]
+        vel = fut[..., 3:6]                                            # [N, T, 3]
+        delta = pos - position.unsqueeze(1)                            # [N, T, 3]
+        dist = torch.linalg.norm(delta, dim=-1, keepdim=True)          # [N, T, 1]
+        speed = torch.linalg.norm(vel, dim=-1, keepdim=True)           # [N, T, 1]
+        return torch.cat([fut, delta, dist, speed], dim=-1)            # [N, T, 11]
+
     # --------- 前向 ---------
     def forward(self, x_raw: torch.Tensor, ctx: ContextBatch) -> torch.Tensor:
         if x_raw.ndim != 3:
@@ -347,14 +387,14 @@ class FullNetV2(nn.Module):
             refined_flat = fut_flat
 
         # 7) LSTM2（意图/威胁）：禁用时填哨兵值
+        #    新接口：forward(fut_norm [N,T,11], position [N,3])
+        #    fusion 在外面做 11 维工程化 + scaler 归一化，再喂给模型
         if self.lstm2 is not None:
-            hist_flat = (
-                x_clean.unsqueeze(1)
-                       .expand(B, K, self.hist_len, Df)
-                       .contiguous()
-                       .reshape(B * K, self.hist_len, Df)
-            )
-            intent_out = self.lstm2(hist_flat, refined_flat)
+            feat11 = self._engineer_lstm2_features(
+                refined_flat, ctx_flat.position,
+            )                                                           # [B*K, T, 11]
+            feat_norm = (feat11 - self.mean_lstm2) / self.std_lstm2     # 广播 [1,1,11]
+            intent_out = self.lstm2(feat_norm, ctx_flat.position)
             intent_logits = intent_out["logits_intent"]                 # [B*K, n_intent]
             threat_raw = intent_out["threat_raw"]                       # [B*K, 1]
             intent_class = (
@@ -424,6 +464,8 @@ def build_full_net_from_fusion_config(fusion_cfg_path: Path) -> FullNetV2:
         lstm1_modes,
         top_k,
         enable_flags,
+        lstm2_mean,
+        lstm2_std,
     ) = build_subnetworks(fusion_cfg, fusion_cfg_dir)
 
     full_cfg = fusion_cfg.get("full_net", {}) or {}
@@ -443,6 +485,8 @@ def build_full_net_from_fusion_config(fusion_cfg_path: Path) -> FullNetV2:
         use_delta_A=bool(full_cfg.get("use_delta_A", True)),
         n_intent_classes=int(full_cfg.get("n_intent_classes", 4)),
         enable_flags=enable_flags,
+        lstm2_mean=lstm2_mean,
+        lstm2_std=lstm2_std,
     )
 
 
