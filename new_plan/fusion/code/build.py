@@ -205,7 +205,24 @@ def build_subnetworks(
     if cfg_path is None:
         raise RuntimeError("fusion.config: gnn1.config 是必填项")
     gnn1_cfg = _load_yaml(cfg_path)
-    gnn1 = build_gnn1(gnn1_cfg)
+
+    # fusion 端的 manual_attention 开关：opset ≤ 13 部署（mindspore-lite 1.8.1）
+    # 需要 GNN1 的 cross-attention 切换到手写版（_ManualCrossAttention），
+    # state_dict 与 nn.MultiheadAttention 严格兼容，可直接 load 现有 ckpt。
+    # 训练侧 gnn1/config.yaml 不受影响。
+    if bool(sec.get("manual_attention", False)):
+        patched_gnn1 = {**gnn1_cfg}
+        gnn1_model_section = dict(patched_gnn1.get("model", {}) or {})
+        gnn1_model_section["manual_attention"] = True
+        patched_gnn1["model"] = gnn1_model_section
+        gnn1 = build_gnn1(patched_gnn1)
+        print(
+            "[Fusion] GNN1: manual_attention=true → "
+            "强制使用 _ManualCrossAttention（opset ≤ 13 部署兼容）"
+        )
+    else:
+        gnn1 = build_gnn1(gnn1_cfg)
+
     _try_load_state_dict(gnn1, _resolve_rel(sec.get("ckpt", ""), fusion_cfg_dir), "GNN1")
     enable_flags["gnn1"] = True
 
@@ -220,8 +237,43 @@ def build_subnetworks(
     enable_flags["constraint_optimizer"] = en
 
     # ---- LSTM2（可选）----
+    # fusion 端的 manual_attention 开关：当部署目标只支持 ONNX opset ≤ 13（如
+    # mindspore-lite 1.8.1）时，nn.TransformerEncoder 的 SDPA 算子无法导出，
+    # 必须走 IntentTransformerManual（state_dict 与 SDPA 版兼容，可直接 load
+    # 现有 ckpt，无需重训）。fusion 在 build_lstm2 之前把 sub_cfg.model.type
+    # 改成 "transformer_manual"，让 lstm2 工厂返回 manual 版。训练侧
+    # lstm2/config.yaml 不受影响。
+    lstm2_sec_for_manual = fusion_cfg.get("lstm2", {}) or {}
+    if (
+        _is_enabled(lstm2_sec_for_manual, default=True)
+        and bool(lstm2_sec_for_manual.get("manual_attention", False))
+    ):
+        def _build_lstm2_manual(sub_cfg: Dict[str, Any]) -> torch.nn.Module:
+            patched = {**sub_cfg}
+            model_section = dict(patched.get("model", {}) or {})
+            orig_type = str(model_section.get("type", "transformer")).lower()
+            if orig_type == "transformer":
+                model_section["type"] = "transformer_manual"
+                patched["model"] = model_section
+                print(
+                    "[Fusion] LSTM2: manual_attention=true → "
+                    "强制使用 transformer_manual（opset ≤ 13 部署兼容）"
+                )
+            elif orig_type != "transformer_manual":
+                # 训练侧用了 bilstm/lstm 等非 SDPA 模型时不强制改写；
+                # 这些模型本来就 opset 11 兼容
+                print(
+                    f"[Fusion] LSTM2: model.type='{orig_type}' 非 SDPA Transformer，"
+                    f"manual_attention 开关被忽略"
+                )
+            return build_lstm2(patched)
+
+        _build_fn_lstm2: Callable[[Dict[str, Any]], torch.nn.Module] = _build_lstm2_manual
+    else:
+        _build_fn_lstm2 = build_lstm2
+
     lstm2, _, en = _build_optional(
-        fusion_cfg, "lstm2", build_lstm2, fusion_cfg_dir, tag="LSTM2",
+        fusion_cfg, "lstm2", _build_fn_lstm2, fusion_cfg_dir, tag="LSTM2",
     )
     enable_flags["lstm2"] = en
 

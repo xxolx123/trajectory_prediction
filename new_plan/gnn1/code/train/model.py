@@ -33,11 +33,13 @@ GNN1 的"对外语义" = 只输出 K=3 条候选 + 重归一化概率；
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 # 默认容量：防御性使用，让 config 缺字段时也能跑
@@ -63,11 +65,101 @@ class Gnn1Config:
     task_type_vocab: int = DEFAULT_TASK_TYPE_VOCAB
     type_vocab: int = DEFAULT_TYPE_VOCAB
 
+    # 部署 opset ≤ 13 时启用：用 _ManualCrossAttention 替代 nn.MultiheadAttention，
+    # 避开 SDPA / aten::unflatten。state_dict key 严格兼容，可直接 load 现有 ckpt。
+    manual_attention: bool = False
+
     def __post_init__(self) -> None:
         if not (1 <= self.top_k <= self.n_modes):
             raise ValueError(
                 f"top_k ({self.top_k}) 必须在 [1, n_modes={self.n_modes}]"
             )
+
+
+# ============================================================
+# Manual cross-attention（ONNX opset ≤ 13 / mindspore-lite 1.8.1 兼容版）
+# ============================================================
+
+class _ManualCrossAttention(nn.Module):
+    """
+    与 ``nn.MultiheadAttention(batch_first=True)`` 数值等价、参数布局完全一致的
+    手写版本。专为 ONNX opset ≤ 13 部署目标设计，避开两类不兼容算子：
+
+      - ``scaled_dot_product_attention``  → opset ≥ 14
+      - ``aten::unflatten`` (出现在 ``view([B, T, h, hd])`` 这种"把一维 split 成
+         多维"的 reshape 上)  → opset ≥ 13
+
+    state_dict keys（严格匹配 ``nn.MultiheadAttention``）::
+
+        in_proj_weight     [3*embed_dim, embed_dim]
+        in_proj_bias       [3*embed_dim]
+        out_proj.weight    [embed_dim, embed_dim]
+        out_proj.bias      [embed_dim]
+
+    forward 接口与 ``nn.MultiheadAttention`` 一致：
+      ``forward(query, key, value) → (out, None)``。
+    第二个返回值 ``attn_weights`` 始终为 None（不计算，避免 ONNX 多输出干扰）。
+    本项目里 GNN1 的 cross-attention 调用方仅取 [0]，与此兼容。
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim({embed_dim}) 必须能被 num_heads({num_heads}) 整除"
+            )
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.dropout_p = float(dropout)
+
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * self.embed_dim, self.embed_dim))
+        self.in_proj_bias = nn.Parameter(torch.empty(3 * self.embed_dim))
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.in_proj_weight)
+        nn.init.zeros_(self.in_proj_bias)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        query: torch.Tensor,    # [B, Tq, D]
+        key: torch.Tensor,      # [B, Tk, D]
+        value: torch.Tensor,    # [B, Tk, D]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        Bq, Tq, D = query.shape
+        Bk, Tk, _ = key.shape
+
+        # 三组投影矩阵：与 nn.MultiheadAttention 的 in_proj_weight chunk(3) 一致
+        wq, wk, wv = self.in_proj_weight.chunk(3, dim=0)
+        bq, bk, bv = self.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(query, wq, bq)                              # [B, Tq, D]
+        k = F.linear(key,   wk, bk)                              # [B, Tk, D]
+        v = F.linear(value, wv, bv)                              # [B, Tk, D]
+
+        h = self.num_heads
+        hd = self.head_dim
+        # 两步 reshape 避免 ONNX 把单步 view([B, T, h, hd]) 识别成 aten::unflatten
+        q = q.reshape(Bq * Tq, h, hd).reshape(Bq, Tq, h, hd).transpose(1, 2)
+        k = k.reshape(Bk * Tk, h, hd).reshape(Bk, Tk, h, hd).transpose(1, 2)
+        v = v.reshape(Bk * Tk, h, hd).reshape(Bk, Tk, h, hd).transpose(1, 2)
+        # q/k/v: [B, h, T*, hd]
+
+        scale = 1.0 / math.sqrt(hd)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale       # [B, h, Tq, Tk]
+        attn = F.softmax(attn, dim=-1)
+        if self.dropout_p > 0.0 and self.training:
+            attn = F.dropout(attn, p=self.dropout_p)
+        out = torch.matmul(attn, v)                               # [B, h, Tq, hd]
+
+        # 合并 head 回 D 维：同样拆两步 reshape 避免 unflatten 形态
+        out = out.transpose(1, 2).contiguous()                    # [B, Tq, h, hd]
+        out = out.reshape(Bq * Tq, D).reshape(Bq, Tq, D)
+        return self.out_proj(out), None
 
 
 class _MLP(nn.Module):
@@ -113,12 +205,21 @@ class Gnn1Selector(nn.Module):
         )
 
         # ---- Cross-attention: Q=ctx, K=V=candidates ----
-        self.attn = nn.MultiheadAttention(
-            embed_dim=cfg.d_emb,
-            num_heads=cfg.n_heads,
-            dropout=cfg.dropout,
-            batch_first=True,
-        )
+        # manual_attention=True 时用手写版（state_dict 完全兼容 nn.MultiheadAttention，
+        # 现有 ckpt 直接 load），避开 ONNX opset ≥ 14 的 SDPA。
+        if cfg.manual_attention:
+            self.attn: nn.Module = _ManualCrossAttention(
+                embed_dim=cfg.d_emb,
+                num_heads=cfg.n_heads,
+                dropout=cfg.dropout,
+            )
+        else:
+            self.attn = nn.MultiheadAttention(
+                embed_dim=cfg.d_emb,
+                num_heads=cfg.n_heads,
+                dropout=cfg.dropout,
+                batch_first=True,
+            )
         self.attn_ln = nn.LayerNorm(cfg.d_emb)
 
         # ---- Scoring head: 每个候选独立得一个分数 ----
@@ -202,5 +303,6 @@ def build_model_from_config(cfg: Dict[str, Any]) -> Gnn1Selector:
         top_k=int(model_cfg.get("top_k", 3)),
         task_type_vocab=DEFAULT_TASK_TYPE_VOCAB,
         type_vocab=type_hi + 1,
+        manual_attention=bool(model_cfg.get("manual_attention", False)),
     )
     return Gnn1Selector(gcfg)

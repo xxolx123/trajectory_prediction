@@ -18,10 +18,19 @@ lstm1:
   ckpt:   "../lstm1/checkpoints"                      # 自动取目录下最新 .pt
   scaler: "../lstm1/data/processed/scaler_posvel.npz" # 可空（fusion 自动用 mean=0/std=1）
 
+# gnn1：候选选择 + top-K 重归一化（含 cross-attention）
+#
+# manual_attention：是否在 fusion 组装时把 GNN1 内部的 nn.MultiheadAttention
+#   切换到手写版本 _ManualCrossAttention。
+#   true  → build.py 给 sub_cfg.model 注入 manual_attention=true，工厂自动
+#           构造 _ManualCrossAttention，避开 ONNX opset ≥ 14 的 SDPA 算子。
+#           ckpt 与 nn.MultiheadAttention 严格兼容，无需重训。
+#   false → 沿用 nn.MultiheadAttention（SDPA 加速版），仅适合 opset ≥ 14 部署目标。
 gnn1:
   enable: true
   config: "../gnn1/config.yaml"
   ckpt:   "../gnn1/checkpoints"                       # 自动取目录下最新 .pt
+  manual_attention: true
 
 constraint_optimizer:
   enable: true
@@ -30,11 +39,18 @@ constraint_optimizer:
 
 # lstm2：意图 + 威胁度（小型 Transformer Encoder，已训练）
 # 新接口（BREAKING）：fusion 端 (engineer 11-dim → 用 lstm2.scaler 归一化 → 喂模型)
+#
+# manual_attention：是否在 fusion 组装时强制走手写 attention 版本
+#   true  → build.py 在 sub_cfg.model.type 改成 "transformer_manual"，
+#           可导出到 ONNX opset ≤ 13（含 mindspore-lite 1.8.1 目标 opset 11）。
+#           ckpt 与 SDPA 版严格兼容，无需重训。
+#   false → 沿用 IntentTransformer（SDPA 版），仅适合 opset ≥ 14 的部署目标。
 lstm2:
   enable: true
   config: "../lstm2/config.yaml"
   ckpt:   "../lstm2/checkpoints"                          # 自动取目录下最新 .pt
   scaler: "../lstm2/data/processed/scaler_intent_posvel.npz"
+  manual_attention: true
 
 # gnn2 目前是占位 MLP，未训练；默认关闭
 gnn2:
