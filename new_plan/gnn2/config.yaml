@@ -1,35 +1,110 @@
 # =============================================================================
-# gnn2 配置（骨架占位）
+# gnn2 配置 —— 打击区域 + 置信度预测（per-trajectory，领前打击决策）
 #
-# 接口：
-#   输入: pred_traj [B, T=10, 6] (路网约束后)，eta [B] long 秒
-#   输出: strike_pos(km) / strike_radius(km) / strike_conf
+# 业务语义（甲方对齐版）：
+#   场景：我方反击装备从 position（我方固定资产）发射，去打击敌方
+#   pred_traj: 敌方未来 10 步预测轨迹（每步 time_step_s=60s）
+#   eta:       我方装备从 position 飞到打击点所需时间（秒）
+#   strike_pos = 敌方在 t=eta 时刻的位置（领前点 = pred_traj 在 eta 的插值）
+#   strike_radius = 该位置的不确定圆（候选预测越偏离 GT 越大）
+#   strike_conf   = 敌方届时确实落在圆内的概率
+#
+# 接口形状（fusion 现状不变）：
+#   输入: pred_traj [B, T=10, 6] (km / km·s⁻¹)，eta [B] long 秒
+#   输出: strike_pos    [B, 3]   km xyz
+#         strike_radius [B, 1]   km，∈ [radius_min_km, radius_max_km]
+#         strike_conf   [B, 1]   ∈ [0, 1]
 # =============================================================================
 
 data:
+  # 输出
   raw_dir: "data/raw"
-  processed_dir: "data/processed"
-  train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
+
+  # 上游依赖（路径相对于 gnn2/）
+  gnn1_config:    "../gnn1/config.yaml"               # 给工厂构造 gnn1 模型用
+  gnn1_cache_dir: "../gnn1/data/cache"                # history / targets / candidates (norm+delta) + scaler
+  gnn1_raw_dir:   "../gnn1/data/raw"                  # candidates / task_type / type / position（gnn1 inference 输入）
+  gnn1_ckpt:      "../gnn1/checkpoints"               # 自动取目录下最新 .pt
+  lstm1_scaler:   "../lstm1/data/processed/scaler_posvel.npz"   # 6 维 StandardScaler
+
+  # 时间尺度（必须跟 lstm1.config.yaml 的 time_step 一致；如改请同步改）
+  time_step_s:    60.0
+  fut_len_steps:  10        # 预测长度，对应 T*time_step_s = 600 秒 = 10 分钟
+  hist_len_steps: 20        # 历史长度（仅文档；gnn2 不直接吃 history）
+
+  # GNN1 inference（top-K 选轨）
+  gnn1_batch_size: 512
+  gnn1_device: "auto"       # "auto" / "cuda" / "cpu"
+
+  random_seed: 42
+
+  # ---- 场景池化与切分（重要：与 gnn1 的 split 边界解耦）----
+  # 数据生成会先把 gnn1 三个 split (train/val/test) 池化成一个"场景池"，
+  # 然后随机抽 max_scenes 条，再按 split_ratios 重切成 train/val/test。
+  # "场景"粒度 = 一条 gnn1 raw sample = (一个历史窗口, 一组 5 候选, 一个 position 噪声采样)。
+  #
+  # 训练样本最终数量 = max_scenes × K=3 × n_eta_per_sample
+  #   - 每条 scene 取 GNN1 选出的 top-3 候选（与部署对齐）
+  #   - 每条候选独立采样 n_eta 个不同 eta 值（数据增强；同一轨迹 + 不同 eta → 不同 GT）
+  max_scenes:        200000      # 0 = 不限（用 gnn1 全量约 3.7M scenes，可能 ~ 17 GB 磁盘）
+  split_ratios:      [0.8, 0.1, 0.1]
+  n_eta_per_sample:  5
+
+  # ---- 合成 GT 规则（R2: 候选 vs target 在 t=eta 的偏差）----
+  # eta 取值范围（秒）。eta=0 对应 hist 末帧（敌方"当前"位置），eta=600 对应 pred_traj 末帧
+  # eta 不能超出 [0, T*time_step_s]，否则要外推预测轨迹（暂未支持）
+  eta_min_sec: 0
+  eta_max_sec: 600
+
+  # radius = clip(a + b * ||cand_at_eta - target_at_eta||, r_min, r_max)
+  # conf   = clip(1 - radius / r_max, 0, 1)
+  radius_a_km:   0.0
+  radius_b:      0.5
+  radius_min_km: 0.5
+  radius_max_km: 10.0
 
 context:
-  # ETA 归一化：模型内部把 eta(秒) / eta_scale_seconds 喂进 MLP
-  eta_scale_seconds: 3600
+  # ETA 归一化：模型内部把 eta_seconds / eta_scale_seconds 喂进 FiLM
+  # 默认 3600（1 小时），实际取值范围 [0, 600] 秒，归一化后 ∈ [0, 0.167]
+  eta_scale_seconds: 600.0
 
 model:
-  type: "gnn2_mlp_stub"     # TODO: "strike_zone_gnn"
-  fut_len: 10
-  feat_dim: 6
-  hidden_size: 128
-  dropout: 0.0
+  # type 二选一：
+  #   "strike_zone_transformer"        训练用，库版 SDPA（GPU 快，需 opset >= 14）
+  #   "strike_zone_transformer_manual" 部署用，手写 attention（state_dict 与库版互通，opset 11 兼容）
+  type: "strike_zone_transformer"
+
+  fut_len:     10
+  feat_dim:    6
+
+  d_emb:       64
+  nhead:       4
+  num_layers:  2
+  ffn_dim:     128
+  dropout:     0.1
+  max_seq_len: 16
+
+  # fusion 端开关：true → fusion/build.py 注入 manual_attention=true，
+  # 工厂自动改走 "strike_zone_transformer_manual"。训练侧不用动。
+  manual_attention: false
+
+loss:
+  w_pos:    1.0
+  w_radius: 1.0
+  w_conf:   0.5
 
 train:
-  device: "auto"
-  seed: 42
-  batch_size: 64
-  num_epochs: 10
-  lr: 1.0e-3
-  weight_decay: 1.0e-5
-  ckpt_dir: "checkpoints"
-  log_interval: 100
+  device:        "auto"
+  seed:          42
+
+  batch_size:    256
+  num_epochs:    20
+
+  lr:            1.0e-3
+  weight_decay:  1.0e-5
+
+  grad_clip:     1.0
+  keep_top_k:    3
+
+  ckpt_dir:      "checkpoints"
+  log_interval:  50

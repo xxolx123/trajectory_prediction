@@ -300,8 +300,33 @@ def build_subnetworks(
             )
 
     # ---- GNN2（可选）----
+    # fusion 端的 manual_attention 开关：当部署目标只支持 ONNX opset ≤ 13（如
+    # mindspore-lite 1.8.1）时，nn.TransformerEncoder 的 SDPA 算子无法导出，
+    # 必须走 StrikeZoneNetManual（state_dict 与 SDPA 版严格兼容，可直接 load
+    # 现有 ckpt，无需重训）。fusion 在 build_gnn2 之前把 sub_cfg.model.manual_attention
+    # 注入为 True，让 gnn2 工厂返回 manual 版。训练侧 gnn2/config.yaml 不受影响。
+    gnn2_sec_for_manual = fusion_cfg.get("gnn2", {}) or {}
+    if (
+        _is_enabled(gnn2_sec_for_manual, default=False)
+        and bool(gnn2_sec_for_manual.get("manual_attention", False))
+    ):
+        def _build_gnn2_manual(sub_cfg: Dict[str, Any]) -> torch.nn.Module:
+            patched = {**sub_cfg}
+            model_section = dict(patched.get("model", {}) or {})
+            model_section["manual_attention"] = True
+            patched["model"] = model_section
+            print(
+                "[Fusion] GNN2: manual_attention=true → "
+                "强制使用 StrikeZoneNetManual（opset ≤ 13 部署兼容）"
+            )
+            return build_gnn2(patched)
+
+        _build_fn_gnn2: Callable[[Dict[str, Any]], torch.nn.Module] = _build_gnn2_manual
+    else:
+        _build_fn_gnn2 = build_gnn2
+
     gnn2, _, en = _build_optional(
-        fusion_cfg, "gnn2", build_gnn2, fusion_cfg_dir, tag="GNN2",
+        fusion_cfg, "gnn2", _build_fn_gnn2, fusion_cfg_dir, tag="GNN2",
     )
     enable_flags["gnn2"] = en
 

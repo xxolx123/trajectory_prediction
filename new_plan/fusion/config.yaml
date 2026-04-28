@@ -52,11 +52,23 @@ lstm2:
   scaler: "../lstm2/data/processed/scaler_intent_posvel.npz"
   manual_attention: true
 
-# gnn2 目前是占位 MLP，未训练；默认关闭
+# gnn2：打击区域 + 置信度（小型 Transformer Encoder + FiLM(ETA)）
+#
+# manual_attention：是否在 fusion 组装时把 GNN2 内部的 nn.TransformerEncoder
+#   切换到手写版本 StrikeZoneNetManual。
+#   true  → build.py 在 sub_cfg.model 注入 manual_attention=true，工厂自动
+#           构造 StrikeZoneNetManual，避开 ONNX opset ≥ 14 的 SDPA 算子，
+#           可导出到 opset 11（mindspore-lite 1.8.1 默认）。
+#           ckpt 与 SDPA 版严格兼容，无需重训。
+#   false → 沿用 StrikeZoneNet（SDPA 版），仅适合 opset ≥ 14 部署目标。
+#
+# enable=true 时 fusion 输入会多一路 eta；enable=false 时 [B,K,68] 的
+# 62..66 列写 NaN 哨兵值。
 gnn2:
-  enable: false
+  enable: true
   config: "../gnn2/config.yaml"
-  ckpt:   ""
+  ckpt:   "../gnn2/checkpoints"                       # 自动取目录下最新 .pt
+  manual_attention: true                              # opset ≤ 13 部署必开
 
 # FullNetV2 自己需要的参数（必须与各子网络对齐）
 # 注意：最终输出的 K（top-K）不在这里配置，由 GNN1 自己产出，
