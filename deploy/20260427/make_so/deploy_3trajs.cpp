@@ -600,16 +600,17 @@ bool TrajSystem::Infer(std::map<int, std::vector<LocData_pred>>& pred_trace,
         hist_buf[t * IN_COLS + 5] = vz;
     }
 
-    // ----------------- 2) ctx 元信息（取末帧；为 0 → cfg 兜底） -----------------
-    auto pick_int = [](int v, int def) { return v != 0 ? v : def; };
+    // ----------------- 2) ctx 元信息（取末帧；哨兵→cfg 兜底） -----------------
+    // 哨兵约定：上层未填的整型字段保持默认 -1，未填的 double 字段保持 NaN。
+    // 这样调用方主动传 0 / 0.0（合法真值，例如 eta=0="打击敌方当前位置"）
+    // 不会再被旧版"!= 0 才认为已填"逻辑静默覆盖成 cfg 默认值。
+    const int     task_type = (last.task_type >= 0) ? last.task_type : g_cfg.default_task_type;
+    const int     our_type  = (last.our_type  >= 0) ? last.our_type  : g_cfg.default_our_type;
+    const int64_t eta_sec   = (last.eta_sec   >= 0) ? last.eta_sec   : g_cfg.default_eta_sec;
 
-    const int     task_type = pick_int(last.task_type, g_cfg.default_task_type);
-    const int     our_type  = pick_int(last.our_type,  g_cfg.default_our_type);
-    const int64_t eta_sec   = (last.eta_sec != 0)
-                              ? last.eta_sec : g_cfg.default_eta_sec;
-
-    const bool has_target_llh =
-        (last.target_lon != 0.0 || last.target_lat != 0.0 || last.target_alt_m != 0.0);
+    const bool has_target_llh = std::isfinite(last.target_lon)
+                             && std::isfinite(last.target_lat)
+                             && std::isfinite(last.target_alt_m);
     const double tgt_lon   = has_target_llh ? last.target_lon   : g_cfg.default_target_lon;
     const double tgt_lat   = has_target_llh ? last.target_lat   : g_cfg.default_target_lat;
     const double tgt_alt_m = has_target_llh ? last.target_alt_m : g_cfg.default_target_alt_m;

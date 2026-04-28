@@ -12,8 +12,15 @@
 //   3) 速度严格按 ENU 映射：vx = Speed_east, vy = Speed_north, vz = Speed_tianxiang。
 // 上层 LSTM_predict(locs, routes, instant_ms) 主签名与旧版保持一致；
 // lstm2/gnn2 输出位（intent/threat/strike_*）若为 NaN/-1 则统一回退到 0。
+//
+// 哨兵约定（fusion 元信息字段）：
+//   未填的 task_type / our_type / eta_sec 取 -1，未填的 target_lon/lat/alt_m
+//   取 NaN；库内据此决定是否走 deploy_cfg.ini 的 default_*。**真值就是 0** 的
+//   场景（例如 eta_sec=0 表示"打击敌方当前位置"）必须由调用方主动写 0；
+//   旧版"0 视作未填"的脆弱判断已废弃。
 
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <list>
 #include <map>
@@ -48,12 +55,14 @@ struct LocData_loc {
     int    static_or_dynam;
 
     // ===== fusion 新增字段：每条观测都带，库内取末帧值喂模型 =====
-    int     task_type    = 0;          // 敌方作战任务（0=打击）
-    int     our_type     = 0;          // 我方固定目标类型 0/1/2
-    double  target_lon   = 0.0;        // 我方固定目标 LLH
-    double  target_lat   = 0.0;
-    double  target_alt_m = 0.0;        // 单位：米
-    int64_t eta_sec      = 0;          // 我方预计到达时间（秒）
+    // 哨兵语义：未填字段保留默认初值（int=-1, double=NaN），cpp 侧据此走
+    // deploy_cfg.ini 的 default_*；调用方真值就是 0/0.0 时必须显式赋值。
+    int     task_type    = -1;          // 敌方作战任务（0=打击）；-1=未填
+    int     our_type     = -1;          // 我方固定目标类型 0/1/2；-1=未填
+    double  target_lon   = std::nan(""); // 我方固定目标 LLH；NaN=未填
+    double  target_lat   = std::nan("");
+    double  target_alt_m = std::nan(""); // 单位：米
+    int64_t eta_sec      = -1;          // 我方预计到达时间（秒，合法 [0,600]）；-1=未填
 };
 
 // ----------------------------------------------------------------------------

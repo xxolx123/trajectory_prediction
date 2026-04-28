@@ -49,6 +49,8 @@ lstm2:
   enable: true
   config: "../lstm2/config.yaml"
   ckpt:   "../lstm2/checkpoints"                          # 自动取目录下最新 .pt
+  # 11 维 StandardScaler（必填；缺失或文件不存在会 raise FileNotFoundError，
+  # 以前的 mean=0/std=1 兜底会让 LSTM2 输出严重漂移，已废弃）
   scaler: "../lstm2/data/processed/scaler_intent_posvel.npz"
   manual_attention: true
 

@@ -280,24 +280,31 @@ def build_subnetworks(
     # ---- LSTM2 11 维 scaler ----
     # 新接口（BREAKING）：fusion 内做 (engineer 11-dim → normalize) 后喂 lstm2，
     # 所以这里必须把 lstm2 训练时的 StandardScaler 拉过来。
+    # 缺失时直接 raise：以前的"mean=0/std=1 兜底"会让 LSTM2 输出严重漂移，
+    # 在生产部署里属于隐性致命错误，必须显式阻断。
     lstm2_mean: Optional[np.ndarray] = None
     lstm2_std: Optional[np.ndarray] = None
     if enable_flags["lstm2"]:
         lstm2_sec = fusion_cfg.get("lstm2", {}) or {}
-        lstm2_scaler_path = _resolve_rel(
-            lstm2_sec.get("scaler", ""), fusion_cfg_dir,
-        )
-        if lstm2_scaler_path is not None and lstm2_scaler_path.exists():
-            lstm2_mean, lstm2_std = load_mean_std_from_npz(lstm2_scaler_path)
-            print(f"[Fusion] LSTM2: 载入 scaler {lstm2_scaler_path}")
-        else:
-            lstm2_mean = np.zeros((11,), dtype=np.float32)
-            lstm2_std = np.ones((11,), dtype=np.float32)
-            print(
-                f"[Fusion] LSTM2[WARN]: 未找到 scaler "
-                f"({lstm2_scaler_path})，使用 mean=0/std=1 兜底；"
-                f"lstm2 输出可能严重偏差，请检查 lstm2.scaler 配置。"
+        lstm2_scaler_raw = lstm2_sec.get("scaler", "")
+        lstm2_scaler_path = _resolve_rel(lstm2_scaler_raw, fusion_cfg_dir)
+        if lstm2_scaler_path is None:
+            raise FileNotFoundError(
+                "fusion.config: lstm2.enable=true 但 lstm2.scaler 字段为空。\n"
+                "请在 fusion/config.yaml 的 lstm2 段填上 11 维 StandardScaler 路径，"
+                "例如 scaler: \"../lstm2/data/processed/scaler_intent_posvel.npz\"。\n"
+                "scaler 由 lstm2/code/data/dataset.py 在数据生成时产出。"
             )
+        if not lstm2_scaler_path.exists():
+            raise FileNotFoundError(
+                f"fusion.config: lstm2.scaler 指向的文件不存在：\n"
+                f"  配置值 = {lstm2_scaler_raw!r}\n"
+                f"  解析后 = {lstm2_scaler_path}\n"
+                "请确认 lstm2 已经跑过 generate_trajs / dataset 流程，"
+                "scaler_intent_posvel.npz 已经写入 lstm2/data/processed/。"
+            )
+        lstm2_mean, lstm2_std = load_mean_std_from_npz(lstm2_scaler_path)
+        print(f"[Fusion] LSTM2: 载入 scaler {lstm2_scaler_path}")
 
     # ---- GNN2（可选）----
     # fusion 端的 manual_attention 开关：当部署目标只支持 ONNX opset ≤ 13（如
