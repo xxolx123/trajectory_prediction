@@ -10,6 +10,6 @@ pyyaml>=6.0
 pandas>=1.5
 matplotlib>=3.7
 
-# ONNX 导出:
+# ONNX 导出 + Python 端验证:
 onnx>=1.14
-# onnxruntime>=1.15   # 若需要 Python 端对 ONNX 做验证
+onnxruntime>=1.15      # fusion/code/test_onnx.py 跑 ONNX 与 PyTorch FullNetV2 数值对比时需要

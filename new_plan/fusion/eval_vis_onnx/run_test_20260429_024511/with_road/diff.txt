@@ -1,0 +1,19 @@
+PyTorch FullNetV2 vs ONNX runtime (full_net_v2_with_road.onnx)
+mode            = with_road
+B               = 4
+gnn2_enabled    = True
+expected inputs = ['hist_traj', 'task_type', 'type', 'position', 'road_points', 'road_mask', 'eta']
+atol            = per-field default（见 _DEFAULT_PER_FIELD_ATOL）
+rtol            = 0.0001
+
+字段对比（PASS = max|Δ| ≤ 该字段 atol 且无单边 NaN）：
+[PASS] output          shape=(4, 3, 68)  max|Δ|=8.178e-04  mean|Δ|=3.317e-05  atol=2e-03  n=816
+[PASS] refined_traj    shape=(4, 3, 10, 6)  max|Δ|=8.178e-04  mean|Δ|=3.523e-05  atol=2e-03  n=720
+[PASS] intent_class    shape=(4, 3)  max|Δ|=0.000e+00  mean|Δ|=0.000e+00  atol=0e+00  n=12
+[PASS] threat_prob     shape=(4, 3)  max|Δ|=3.558e-05  mean|Δ|=1.403e-05  atol=1e-04  n=12
+[PASS] strike_pos      shape=(4, 3, 3)  max|Δ|=2.518e-04  mean|Δ|=3.543e-05  atol=2e-03  n=36
+[PASS] strike_radius   shape=(4, 3)  max|Δ|=5.245e-06  mean|Δ|=5.315e-07  atol=1e-03  n=12
+[PASS] strike_conf     shape=(4, 3)  max|Δ|=1.371e-06  mean|Δ|=2.285e-07  atol=1e-04  n=12
+[PASS] mode_prob       shape=(4, 3)  max|Δ|=3.777e-05  mean|Δ|=2.097e-05  atol=1e-04  n=12
+
+overall = PASS  (per-field atol; 见上方每行)
